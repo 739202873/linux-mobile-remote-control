@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Mobile-RC host helper CLI (`control-access`).
+
+Usage:
+  sudo control-access                 Generate a fresh 6-digit one-time code
+  sudo control-access --setup-termux  Print 1-line setup command for Termux
+  sudo control-access --setup-email   Configure Gmail/SMTP bot & allowed emails for online OTP
+  sudo control-access --test-email    Send a test email using saved Email OTP settings
+"""
+
+import argparse
+from email.message import EmailMessage
+import getpass
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import smtplib
+import ssl
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+CONFIG_FILE = os.environ.get("MRC_CONFIG_DIR", "/opt/mobile-rc") + "/config.json"
+DEFAULT_PORT = int(os.environ.get("MRC_PORT", "8000"))
+_EMAIL_RE = re.compile(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$")
+
+CYAN = "\033[0;36m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[1;33m"
+RED = "\033[0;31m"
+BOLD = "\033[1m"
+NC = "\033[0m"
+
+
+def get_lan_ips():
+    ips = []
+    if shutil.which("ip"):
+        res = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if "inet" in parts:
+                    idx = parts.index("inet") + 1
+                    if idx < len(parts):
+                        ip = parts[idx].split("/", 1)[0]
+                        if ip and not ip.startswith("127.") and ip not in ips:
+                            ips.append(ip)
+    return ips
+
+
+def load_config():
+    if os.geteuid() != 0 and not os.access(CONFIG_FILE, os.R_OK):
+        print(f"{RED}Permission denied reading {CONFIG_FILE}. Run with: sudo control-access{NC}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(CONFIG_FILE):
+        print(f"{RED}Config not found at {CONFIG_FILE}. Run sudo ./install.sh first.{NC}", file=sys.stderr)
+        sys.exit(1)
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def print_termux_setup(cfg, port):
+    token = str(cfg.get("termux_token") or "").strip()
+    if not token:
+        print(f"{RED}No termux_token found in {CONFIG_FILE}. Run sudo ./update.sh first.{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    ips = get_lan_ips()
+    urls = [f"http://{ip}:{port}" for ip in ips]
+    urls.append(f"http://127.0.0.1:{port}")
+    primary = urls[0]
+    url_args = " ".join(shlex.quote(u) for u in urls)
+
+    cmd = (
+        f"mkdir -p \"$PREFIX/bin\" && "
+        f"curl -fsSL {shlex.quote(primary + '/assets/control-access')} -o \"$PREFIX/bin/control-access\" && "
+        f"chmod +x \"$PREFIX/bin/control-access\" && "
+        f"control-access init {shlex.quote(token)} {url_args}"
+    )
+
+    print(f"\n{CYAN}===================================================={NC}")
+    print(f"{GREEN}{BOLD}   📱 Termux One-Line Setup (`control-access`)      {NC}")
+    print(f"{CYAN}===================================================={NC}")
+    print("Paste this command into Termux on your smartphone:\n")
+    print(f"{YELLOW}{cmd}{NC}\n")
+    print("After setup, simply type:")
+    print(f"  {CYAN}control-access{NC}         -> generate random 6-digit code")
+    print(f"  {CYAN}control-access --open{NC}  -> generate code & open browser")
+    print(f"{CYAN}===================================================={NC}\n")
+
+
+def request_code(cfg, port):
+    token = str(cfg.get("termux_token") or "").strip()
+    if not token:
+        print(f"{RED}No termux_token found in {CONFIG_FILE}. Run sudo ./update.sh first.{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/pairing/code",
+        data=b"{}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(f"{RED}Server returned HTTP {e.code}: {e.read().decode('utf-8', errors='ignore')}{NC}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"{RED}Could not connect to Mobile-RC server on port {port}: {e}{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    code = data.get("code", "")
+    ttl = data.get("expires_in", 180)
+    ips = data.get("ips") or get_lan_ips()
+    tunnel_url = data.get("tunnel_url", "")
+
+    print(f"\n{CYAN}============================================{NC}")
+    print(f"{GREEN}{BOLD}   🔑 Mobile-RC • Random Access Code        {NC}")
+    print(f"{CYAN}============================================{NC}")
+    print(f"   Code    : {YELLOW}{BOLD}{code}{NC}")
+    print(f"   Valid   : {ttl}s (single-use)")
+    if ips:
+        print(f"   URL     : {CYAN}http://{ips[0]}:{port}{NC}")
+        for extra in ips[1:]:
+            print(f"             {CYAN}http://{extra}:{port}{NC}")
+    else:
+        print(f"   URL     : {CYAN}http://localhost:{port}{NC}")
+    if tunnel_url:
+        print(f"   Tunnel  : {CYAN}{tunnel_url}{NC}")
+    print(f"{CYAN}============================================{NC}\n")
+
+
+def _norm_email(val):
+    s = str(val or "").strip().lower()
+    if not s or len(s) > 254 or any(ch in s for ch in ("\r", "\n", "\0", "<", ">", " ")):
+        return ""
+    return s if _EMAIL_RE.match(s) else ""
+
+
+def save_config(cfg):
+    cfg_dir = os.path.dirname(CONFIG_FILE) or "/opt/mobile-rc"
+    os.makedirs(cfg_dir, mode=0o700, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".cfg_", dir=cfg_dir)
+    try:
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, CONFIG_FILE)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def send_test_email(cfg, recipient=None):
+    sec = cfg.get("email_otp") or {}
+    host = str(sec.get("smtp_host") or "smtp.gmail.com").strip()
+    port = int(sec.get("smtp_port") or 587)
+    user = _norm_email(sec.get("smtp_user") or "")
+    pwd = str(sec.get("smtp_pass") or "").strip()
+    if host.lower().endswith("gmail.com"):
+        pwd = pwd.replace(" ", "")
+    allowed = [_norm_email(x) for x in (sec.get("allowed_emails") or []) if _norm_email(x)]
+    target = _norm_email(recipient) if recipient else (allowed[0] if allowed else "")
+
+    if not (host and user and pwd and target):
+        print(f"{RED}Email OTP is not fully configured yet. Run: sudo control-access --setup-email{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    msg = EmailMessage()
+    msg["Subject"] = "[Mobile-RC] SMTP Bot Test"
+    msg["From"] = user
+    msg["To"] = target
+    msg.set_content(
+        f"Mobile-RC SMTP test succeeded on {platform.node() or 'Linux PC'}.\n"
+        f"Online / non-local OTP delivery is ready for {', '.join(allowed)}.\n"
+    )
+    print(f"Sending test email to {CYAN}{target}{NC} via {host}:{port}...")
+    try:
+        ctx = ssl.create_default_context()
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=15, context=ctx) as srv:
+                srv.login(user, pwd)
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=15) as srv:
+                srv.ehlo()
+                srv.starttls(context=ctx)
+                srv.ehlo()
+                srv.login(user, pwd)
+                srv.send_message(msg)
+        print(f"{GREEN}✓ Test email sent successfully! Check {target}'s inbox.{NC}")
+    except Exception as e:
+        print(f"{RED}✗ Failed to send test email: {e}{NC}", file=sys.stderr)
+        sys.exit(1)
+
+
+def setup_email(cfg):
+    if os.geteuid() != 0 and not os.access(CONFIG_FILE, os.W_OK):
+        print(f"{RED}Permission denied writing {CONFIG_FILE}. Run with: sudo control-access --setup-email{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    cur = cfg.get("email_otp") if isinstance(cfg.get("email_otp"), dict) else {}
+    def_host = str(cur.get("smtp_host") or "smtp.gmail.com")
+    def_port = str(cur.get("smtp_port") or "587")
+    def_user = str(cur.get("smtp_user") or "")
+    def_allowed = ", ".join(cur.get("allowed_emails") or [])
+
+    print(f"\n{CYAN}===================================================={NC}")
+    print(f"{GREEN}{BOLD}   📧 Mobile-RC • Online Email OTP Setup           {NC}")
+    print(f"{CYAN}===================================================={NC}")
+    print("Tip: For Gmail, turn on 2-Step Verification and create a")
+    print("     16-char Google App Password (do NOT use main password).\n")
+
+    host = input(f"SMTP Host [{def_host}]: ").strip() or def_host
+    raw_port = input(f"SMTP Port (587=STARTTLS, 465=SSL) [{def_port}]: ").strip() or def_port
+    try:
+        port = max(1, min(65535, int(raw_port)))
+    except ValueError:
+        print(f"{RED}Invalid SMTP port.{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    while True:
+        raw_user = input(f"Bot Sender Email [{def_user}]: ").strip() or def_user
+        smtp_user = _norm_email(raw_user)
+        if smtp_user:
+            break
+        print(f"{RED}Please enter a valid sender email address.{NC}")
+
+    prompt_pw = "Bot App Password (hidden; leave empty to keep existing): " if cur.get("smtp_pass") else "Bot App Password (hidden): "
+    raw_pass = getpass.getpass(prompt_pw).strip()
+    smtp_pass = raw_pass if raw_pass else str(cur.get("smtp_pass") or "").strip()
+    if host.lower().endswith("gmail.com"):
+        smtp_pass = smtp_pass.replace(" ", "")
+    if not smtp_pass:
+        print(f"{RED}App Password cannot be empty.{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    default_rec = def_allowed or smtp_user
+    while True:
+        raw_allowed = input(f"Allowed Login Email(s), comma-separated [{default_rec}]: ").strip() or default_rec
+        allowed = []
+        bad = []
+        for item in raw_allowed.split(","):
+            norm = _norm_email(item)
+            if norm:
+                if norm not in allowed:
+                    allowed.append(norm)
+            elif item.strip():
+                bad.append(item.strip())
+        if bad:
+            print(f"{RED}Invalid email(s): {', '.join(bad)}{NC}")
+            continue
+        if allowed:
+            break
+        print(f"{RED}At least one allowed email is required.{NC}")
+
+    cfg["email_otp"] = {
+        "enabled": True,
+        "smtp_host": host,
+        "smtp_port": port,
+        "smtp_user": smtp_user,
+        "smtp_pass": smtp_pass,
+        "allowed_emails": allowed,
+    }
+    save_config(cfg)
+    print(f"\n{GREEN}✓ Email OTP settings saved securely to {CONFIG_FILE} (0600).{NC}")
+    print(f"  Sender Bot    : {CYAN}{smtp_user}{NC}")
+    print(f"  Allowed Users : {CYAN}{', '.join(allowed)}{NC}")
+
+    ans = input("\nSend a test email right now? [Y/n]: ").strip().lower()
+    if ans in ("", "y", "yes"):
+        send_test_email(cfg)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Mobile-RC pairing & code generator CLI")
+    parser.add_argument("--setup-termux", action="store_true", help="Show 1-line setup command for Termux")
+    parser.add_argument("--setup-email", action="store_true", help="Configure Gmail/SMTP bot & allowed emails for online OTP")
+    parser.add_argument("--test-email", action="store_true", help="Send a test email using saved Email OTP settings")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Local Mobile-RC server port")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    if args.setup_termux:
+        print_termux_setup(cfg, args.port)
+    elif args.setup_email:
+        setup_email(cfg)
+    elif args.test_email:
+        send_test_email(cfg)
+    else:
+        request_code(cfg, args.port)
+
+
+if __name__ == "__main__":
+    main()
