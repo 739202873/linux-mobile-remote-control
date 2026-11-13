@@ -6,6 +6,12 @@ Usage:
   sudo control-access --setup-termux  Print 1-line setup command for Termux
   sudo control-access --setup-email   Configure Gmail/SMTP bot & allowed emails for online OTP
   sudo control-access --test-email    Send a test email using saved Email OTP settings
+  control-access --status             Show service runtime and boot auto-start status
+  sudo control-access --enable        Enable auto-start on boot
+  sudo control-access --disable       Disable auto-start on boot
+  sudo control-access --start         Start Mobile-RC service now
+  sudo control-access --stop          Stop Mobile-RC service now
+  sudo control-access --restart       Restart Mobile-RC service now
 """
 
 import argparse
@@ -291,13 +297,146 @@ def setup_email(cfg):
         send_test_email(cfg)
 
 
+def _detect_init_mode():
+    if shutil.which("systemctl") and os.path.isdir("/run/systemd/system") and os.path.exists("/etc/systemd/system/mobile-rc.service"):
+        return "systemd"
+    if shutil.which("rc-service") and os.path.exists("/etc/init.d/mobile-rc"):
+        return "openrc"
+    return "nohup"
+
+
+def _service_state(mode):
+    running = False
+    autostart = "unsupported"
+    if mode == "systemd":
+        running = subprocess.run(["systemctl", "is-active", "--quiet", "mobile-rc.service"], check=False).returncode == 0
+        en_rc = subprocess.run(["systemctl", "is-enabled", "--quiet", "mobile-rc.service"], check=False).returncode
+        autostart = "enabled" if en_rc == 0 else "disabled"
+    elif mode == "openrc":
+        running = subprocess.run(["rc-service", "mobile-rc", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
+        en = os.path.exists("/etc/runlevels/default/mobile-rc")
+        if not en and shutil.which("rc-update"):
+            res = subprocess.run(["rc-update", "show", "default"], capture_output=True, text=True, check=False)
+            if res.returncode == 0 and "mobile-rc" in res.stdout:
+                en = True
+        autostart = "enabled" if en else "disabled"
+    else:
+        if shutil.which("pgrep"):
+            running = subprocess.run(["pgrep", "-f", "/opt/mobile-rc/server.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
+    return running, autostart
+
+
+def print_service_status():
+    mode = _detect_init_mode()
+    running, autostart = _service_state(mode)
+    run_lbl = f"{GREEN}running{NC}" if running else f"{YELLOW}stopped{NC}"
+    auto_lbl = (
+        f"{GREEN}enabled{NC}" if autostart == "enabled"
+        else f"{YELLOW}disabled{NC}" if autostart == "disabled"
+        else f"{YELLOW}manual (nohup){NC}"
+    )
+    print(f"Service Status : {run_lbl} (init: {mode})")
+    print(f"Boot Auto-Start: {auto_lbl}")
+
+
+def _require_root_for_service(flag_name):
+    if os.geteuid() != 0:
+        print(f"{RED}Root permission required. Run with: sudo control-access {flag_name}{NC}", file=sys.stderr)
+        sys.exit(1)
+
+
+def manage_boot_autostart(enable):
+    _require_root_for_service("--enable" if enable else "--disable")
+    mode = _detect_init_mode()
+    if mode == "systemd":
+        action = "enable" if enable else "disable"
+        res = subprocess.run(["systemctl", action, "mobile-rc.service"], capture_output=True, text=True, check=False)
+    elif mode == "openrc":
+        args = ["rc-update", "add", "mobile-rc", "default"] if enable else ["rc-update", "del", "mobile-rc", "default"]
+        res = subprocess.run(args, capture_output=True, text=True, check=False)
+    else:
+        print(f"{YELLOW}No systemd or OpenRC unit found; nohup mode does not register boot auto-start.{NC}")
+        return
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout or "").strip()
+        print(f"{RED}Failed to update boot auto-start ({mode}): {err}{NC}", file=sys.stderr)
+        sys.exit(1)
+    state_word = f"{GREEN}enabled{NC}" if enable else f"{YELLOW}disabled{NC}"
+    print(f"Mobile-RC boot auto-start is now {state_word} ({mode}).")
+
+
+def manage_runtime_service(action):
+    _require_root_for_service(f"--{action}")
+    mode = _detect_init_mode()
+    if mode == "systemd":
+        res = subprocess.run(["systemctl", action, "mobile-rc.service"], capture_output=True, text=True, check=False)
+        if res.returncode != 0:
+            print(f"{RED}systemctl {action} failed: {(res.stderr or res.stdout).strip()}{NC}", file=sys.stderr)
+            sys.exit(1)
+    elif mode == "openrc":
+        if action == "stop" and not _service_state(mode)[0]:
+            print(f"{YELLOW}Mobile-RC service is already stopped.{NC}")
+            return
+        res = subprocess.run(["rc-service", "mobile-rc", action], capture_output=True, text=True, check=False)
+        if res.returncode != 0:
+            print(f"{RED}rc-service {action} failed: {(res.stderr or res.stdout).strip()}{NC}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if action in ("stop", "restart") and shutil.which("pkill"):
+            subprocess.run(["pkill", "-f", "/opt/mobile-rc/server.py"], check=False)
+        if action in ("start", "restart"):
+            env = os.environ.copy()
+            if os.path.exists(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                        t_user = str(json.load(f).get("target_user") or "").strip()
+                    if t_user:
+                        env["MRC_USER"] = t_user
+                except Exception:
+                    pass
+            with open("/var/log/mobile-rc.log", "ab") as logf:
+                subprocess.Popen(
+                    [sys.executable, "/opt/mobile-rc/server.py"],
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+    print(f"{GREEN}Mobile-RC service {action} completed ({mode}).{NC}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Mobile-RC pairing & code generator CLI")
+    parser = argparse.ArgumentParser(description="Mobile-RC pairing, Email OTP & service control CLI")
     parser.add_argument("--setup-termux", action="store_true", help="Show 1-line setup command for Termux")
     parser.add_argument("--setup-email", action="store_true", help="Configure Gmail/SMTP bot & allowed emails for online OTP")
     parser.add_argument("--test-email", action="store_true", help="Send a test email using saved Email OTP settings")
+    parser.add_argument("--status", action="store_true", help="Show Mobile-RC service runtime and boot auto-start status")
+    boot_grp = parser.add_mutually_exclusive_group()
+    boot_grp.add_argument("--enable", action="store_true", help="Enable Mobile-RC auto-start on boot")
+    boot_grp.add_argument("--disable", action="store_true", help="Disable Mobile-RC auto-start on boot")
+    svc_grp = parser.add_mutually_exclusive_group()
+    svc_grp.add_argument("--start", action="store_true", help="Start Mobile-RC background service now")
+    svc_grp.add_argument("--stop", action="store_true", help="Stop Mobile-RC background service now")
+    svc_grp.add_argument("--restart", action="store_true", help="Restart Mobile-RC background service now")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Local Mobile-RC server port")
     args = parser.parse_args()
+
+    has_svc_action = any((args.status, args.enable, args.disable, args.start, args.stop, args.restart))
+    if has_svc_action:
+        if args.enable:
+            manage_boot_autostart(True)
+        elif args.disable:
+            manage_boot_autostart(False)
+        if args.start:
+            manage_runtime_service("start")
+        elif args.stop:
+            manage_runtime_service("stop")
+        elif args.restart:
+            manage_runtime_service("restart")
+        if args.status or not (args.start or args.stop or args.restart):
+            print_service_status()
+        return
 
     cfg = load_config()
     if args.setup_termux:

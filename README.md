@@ -164,6 +164,22 @@ Runtime configuration and secrets are stored outside the repository in `/opt/mob
 
 ---
 
+##  Service & Boot Auto-Start Control
+
+Manage the background service and boot auto-start (supports OpenRC and systemd) directly with `control-access`:
+
+```bash
+control-access --status              # check running state & boot auto-start
+sudo control-access --disable        # disable auto-start on boot (keep manual)
+sudo control-access --disable --stop # disable auto-start & stop service now
+sudo control-access --enable --start # re-enable auto-start & start now
+sudo control-access --start          # start manually
+sudo control-access --stop           # stop manually
+sudo control-access --restart        # restart service
+```
+
+---
+
 ##  Updating
 
 To pull the latest updates and safely restart the background service while preserving your existing PIN, configuration, and SSH keys:
