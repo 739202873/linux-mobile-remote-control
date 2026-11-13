@@ -3,8 +3,10 @@ set -euo pipefail
 
 # ==========================================================
 # Mobile-RC — Termux Client CLI (`control-access`)
-# Requests a fresh random one-time 6-digit access code from
-# your paired Linux PC so no static PIN stays active while idle.
+# Token-free client:
+# - Local LAN: prompts for 6-digit RAC from `sudo control-access` on PC/Laptop
+# - Non-Local: requests 6-digit RAC via Email OTP, then prompts for the RAC
+# Verified RAC automatically opens and logs into the web dashboard.
 # ==========================================================
 
 CFG_DIR="${HOME}/.config/mobile-rc"
@@ -20,14 +22,23 @@ NC='\033[0m'
 usage() {
     cat << 'EOF'
 Usage:
-  control-access                 Generate a fresh 6-digit one-time code
-  control-access -o | --open     Generate code and open dashboard URL
-  control-access <URL>           Generate code using a specific URL (saved on success)
-  control-access init <TOKEN> <URL1> [URL2...]
-                                 Pair this Termux client with your PC
-  control-access add-url <URL>   Add another laptop URL (LAN IP or tunnel URL)
-  control-access status          Show configured URLs
+  control-access                 Connect (Local RAC from PC, or Email RAC if non-local)
+  control-access <6-DIGIT-RAC>   Verify 6-digit RAC and auto-open unlocked dashboard
+  control-access <URL>           Connect using a specific host/tunnel URL
+  control-access init <URL1> [URL2...]
+                                 Save PC / host URL(s) (no static token stored on phone)
+  control-access add-url <URL>   Add another PC / host URL (LAN IP or tunnel URL)
+  control-access status          Show configured URLs and saved email
 EOF
+}
+
+is_url_or_host() {
+    local s="$1"
+    case "$s" in
+        http://*|https://*) return 0 ;;
+        *.*.*.*|localhost|localhost:*|*.*.*.*:*|*.local|*.local:*|*.lhr.life*|*.trycloudflare.com*|*.ngrok*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 normalize_url() {
@@ -40,15 +51,14 @@ normalize_url() {
 }
 
 save_config() {
-    local token="$1"
+    local email="$1"
     shift
     mkdir -p -m 700 "${CFG_DIR}"
     local urls_joined="$*"
-    local tmp
-    tmp="$(mktemp)"
+    local tmp="${CFG_DIR}/.config.tmp.$$"
     umask 077
     {
-        printf 'MRC_TERMUX_TOKEN=%q\n' "${token}"
+        printf 'MRC_EMAIL=%q\n' "${email}"
         printf 'MRC_URLS=%q\n' "${urls_joined}"
     } > "${tmp}"
     mv -f "${tmp}" "${CFG_FILE}"
@@ -57,14 +67,15 @@ save_config() {
 
 load_config() {
     if [ ! -f "${CFG_FILE}" ]; then
-        echo -e "${RED}Termux is not paired with your laptop yet.${NC}" >&2
+        echo -e "${RED}Termux is not configured with your PC / host URL yet.${NC}" >&2
         echo -e "Run ${CYAN}sudo control-access --setup-termux${NC} on your PC and paste the command here." >&2
         exit 1
     fi
     # shellcheck disable=SC1090
     source "${CFG_FILE}"
-    if [ -z "${MRC_TERMUX_TOKEN:-}" ] || [ -z "${MRC_URLS:-}" ]; then
-        echo -e "${RED}Invalid config in ${CFG_FILE}. Re-run 'control-access init ...'.${NC}" >&2
+    MRC_EMAIL="${MRC_EMAIL:-}"
+    if [ -z "${MRC_URLS:-}" ]; then
+        echo -e "${RED}Invalid config in ${CFG_FILE}. Re-run 'control-access init <URL>'.${NC}" >&2
         exit 1
     fi
 }
@@ -78,30 +89,108 @@ json_extract_str() {
         | sed -E 's/^[^:]+:[[:space:]]*"([^"]*)"$/\1/'
 }
 
-json_extract_int() {
+json_extract_bool() {
     local key="$1"
     local json="$2"
     printf '%s' "${json}" \
-        | grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]+" \
+        | grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*(true|false)" \
         | head -n 1 \
-        | sed -E 's/^[^:]+:[[:space:]]*([0-9]+)$/\1/'
+        | sed -E 's/^[^:]+:[[:space:]]*(true|false)$/\1/'
+}
+
+http_get() {
+    local url="$1"
+    if command -v curl >/dev/null 2>&1; then
+        curl -sS --max-time 4 -w '\nHTTP_STATUS:%{http_code}' "${url}" 2>/dev/null || return 1
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "${url}" << 'PYEOF'
+import sys, urllib.request, urllib.error
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=4) as r:
+        print(r.read().decode("utf-8"))
+        print(f"HTTP_STATUS:{r.status}")
+except urllib.error.HTTPError as e:
+    print(e.read().decode("utf-8", errors="ignore"))
+    print(f"HTTP_STATUS:{e.code}")
+except Exception:
+    sys.exit(1)
+PYEOF
+    else
+        echo -e "${RED}Error: Please install curl in Termux: pkg install curl${NC}" >&2
+        exit 1
+    fi
+}
+
+http_post_json() {
+    local url="$1"
+    local payload="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -sS --max-time 10 -w '\nHTTP_STATUS:%{http_code}' \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "${payload}" \
+            "${url}" 2>/dev/null || return 1
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "${url}" "${payload}" << 'PYEOF'
+import sys, urllib.request, urllib.error
+req = urllib.request.Request(
+    sys.argv[1],
+    data=sys.argv[2].encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        print(r.read().decode("utf-8"))
+        print(f"HTTP_STATUS:{r.status}")
+except urllib.error.HTTPError as e:
+    print(e.read().decode("utf-8", errors="ignore"))
+    print(f"HTTP_STATUS:{e.code}")
+except Exception:
+    sys.exit(1)
+PYEOF
+    else
+        echo -e "${RED}Error: Please install curl in Termux: pkg install curl${NC}" >&2
+        exit 1
+    fi
+}
+
+open_url_in_browser() {
+    local target_url="$1"
+    if command -v termux-open-url >/dev/null 2>&1; then
+        termux-open-url "${target_url}" 2>/dev/null && return 0
+    fi
+    if command -v am >/dev/null 2>&1; then
+        am start -a android.intent.action.VIEW -d "${target_url}" >/dev/null 2>&1 && return 0
+    fi
+    return 1
 }
 
 cmd_init() {
-    if [ "$#" -lt 2 ]; then
-        echo -e "${RED}Usage: control-access init <TOKEN> <URL1> [URL2...]${NC}" >&2
+    if [ "$#" -lt 1 ]; then
+        echo -e "${RED}Usage: control-access init <URL1> [URL2...]${NC}" >&2
         exit 1
     fi
-    local token="$1"
-    shift
     local urls=()
-    local u
-    for u in "$@"; do
-        urls+=("$(normalize_url "$u")")
+    local arg
+    for arg in "$@"; do
+        if is_url_or_host "${arg}"; then
+            urls+=("$(normalize_url "${arg}")")
+        fi
     done
-    save_config "${token}" "${urls[@]}"
-    echo -e "${GREEN}✓ Mobile-RC Termux pairing saved to ${CFG_FILE} (mode 600).${NC}"
-    echo -e "Type ${CYAN}control-access${NC} anytime to generate a random access code."
+    if [ "${#urls[@]}" -eq 0 ]; then
+        echo -e "${RED}No valid host URL provided to 'control-access init'.${NC}" >&2
+        exit 1
+    fi
+    local prev_email=""
+    if [ -f "${CFG_FILE}" ]; then
+        # shellcheck disable=SC1090
+        source "${CFG_FILE}" || true
+        prev_email="${MRC_EMAIL:-}"
+    fi
+    save_config "${prev_email}" "${urls[@]}"
+    echo -e "${GREEN}Mobile-RC host URL(s) saved to ${CFG_FILE} (token-free mode).${NC}"
+    echo -e "Type ${CYAN}control-access${NC} anytime to enter your 6-digit RAC and auto-open the dashboard."
 }
 
 cmd_add_url() {
@@ -119,61 +208,30 @@ cmd_add_url() {
             updated+=("${existing}")
         fi
     done
-    save_config "${MRC_TERMUX_TOKEN}" "${updated[@]}"
-    echo -e "${GREEN}✓ Added primary URL: ${new_u}${NC}"
+    save_config "${MRC_EMAIL:-}" "${updated[@]}"
+    echo -e "${GREEN}Added primary URL: ${new_u}${NC}"
 }
 
 cmd_status() {
     load_config
-    echo -e "${CYAN}Configured Mobile-RC URLs:${NC}"
+    echo -e "${CYAN}Configured Mobile-RC URLs (token-free RAC mode):${NC}"
     local u
     for u in ${MRC_URLS}; do
         echo "  - ${u}"
     done
-}
-
-request_code_from_url() {
-    local url="$1"
-    local token="$2"
-    if command -v curl >/dev/null 2>&1; then
-        curl -sS --max-time 3 -w '\nHTTP_STATUS:%{http_code}' \
-            -X POST \
-            -H "Authorization: Bearer ${token}" \
-            -H "Content-Type: application/json" \
-            -d '{}' \
-            "${url}/api/pairing/code" 2>/dev/null || return 1
-    elif command -v python3 >/dev/null 2>&1; then
-        python3 - "${url}/api/pairing/code" "${token}" << 'PYEOF'
-import sys, urllib.request, urllib.error
-req = urllib.request.Request(
-    sys.argv[1],
-    data=b"{}",
-    headers={"Authorization": "Bearer " + sys.argv[2], "Content-Type": "application/json"},
-    method="POST",
-)
-try:
-    with urllib.request.urlopen(req, timeout=3) as r:
-        print(r.read().decode("utf-8"))
-        print(f"HTTP_STATUS:{r.status}")
-except urllib.error.HTTPError as e:
-    print(e.read().decode("utf-8", errors="ignore"))
-    print(f"HTTP_STATUS:{e.code}")
-except Exception:
-    sys.exit(1)
-PYEOF
-    else
-        echo -e "${RED}Error: Please install curl in Termux: pkg install curl${NC}" >&2
-        exit 1
+    if [ -n "${MRC_EMAIL:-}" ]; then
+        echo -e "${CYAN}Saved Email:${NC} ${MRC_EMAIL}"
     fi
 }
 
-cmd_request() {
-    local open_browser=0
+cmd_connect() {
     local custom_url=""
+    local supplied_rac=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            -o|--open) open_browser=1 ;;
+            -o|--open) ;;
             -h|--help) usage; exit 0 ;;
+            [0-9][0-9][0-9][0-9][0-9][0-9]) supplied_rac="$1" ;;
             *) custom_url="$(normalize_url "$1")" ;;
         esac
         shift
@@ -192,75 +250,120 @@ cmd_request() {
         fi
     done
 
-    local chosen_url="" body="" http_code=""
+    local chosen_url="" status_body="" http_code=""
     for u in "${candidates[@]}"; do
         local raw
-        if raw="$(request_code_from_url "${u}" "${MRC_TERMUX_TOKEN}")"; then
+        if raw="$(http_get "${u}/api/auth/status")"; then
             http_code="$(printf '%s\n' "${raw}" | sed -n 's/^HTTP_STATUS://p' | tail -n 1)"
-            body="$(printf '%s\n' "${raw}" | sed '/^HTTP_STATUS:/d')"
+            status_body="$(printf '%s\n' "${raw}" | sed '/^HTTP_STATUS:/d')"
             if [ "${http_code}" = "200" ]; then
                 chosen_url="${u}"
                 break
-            elif [ "${http_code}" = "401" ] || [ "${http_code}" = "403" ] || [ "${http_code}" = "429" ]; then
-                local msg
-                msg="$(json_extract_str "message" "${body}")"
-                echo -e "${RED}Rejected by ${u} (HTTP ${http_code}): ${msg:-Authentication error}${NC}" >&2
-                exit 1
             fi
         fi
     done
 
     if [ -z "${chosen_url}" ]; then
-        echo -e "${RED}Could not reach your laptop Mobile-RC server.${NC}" >&2
+        echo -e "${RED}Could not reach your PC / host Mobile-RC server.${NC}" >&2
         echo -e "Checked URLs: ${MRC_URLS}" >&2
-        echo -e "Tip: Check Wi-Fi/Hotspot connection, or pass current laptop IP: ${CYAN}control-access http://<LAPTOP_IP>:8000${NC}" >&2
+        echo -e "Tip: If on a different network, pass your tunnel URL: ${CYAN}control-access https://<tunnel-url>${NC}" >&2
         exit 1
     fi
 
-    # Save custom URL as first priority if it succeeded
     if [ -n "${custom_url}" ] && [ "${chosen_url}" = "${custom_url}" ]; then
         local updated=("${custom_url}")
         for u in ${MRC_URLS}; do
             [ "${u}" != "${custom_url}" ] && updated+=("${u}")
         done
-        save_config "${MRC_TERMUX_TOKEN}" "${updated[@]}"
+        save_config "${MRC_EMAIL:-}" "${updated[@]}"
     fi
 
-    local code ttl tunnel_url
-    code="$(json_extract_str "code" "${body}")"
-    ttl="$(json_extract_int "expires_in" "${body}")"
-    tunnel_url="$(json_extract_str "tunnel_url" "${body}")"
+    local is_non_local email_enabled
+    is_non_local="$(json_extract_bool "is_non_local" "${status_body}")"
+    email_enabled="$(json_extract_bool "email_otp_enabled" "${status_body}")"
 
-    if [ -z "${code}" ]; then
-        echo -e "${RED}Unexpected response from server: ${body}${NC}" >&2
+    echo ""
+    echo -e "${CYAN}====================================================${NC}"
+    if [ "${is_non_local}" = "true" ]; then
+        echo -e "${GREEN}${BOLD}   Mobile-RC • Non-Local Access (Email RAC)${NC}"
+        echo -e "${CYAN}====================================================${NC}"
+        echo -e "   Server : ${CYAN}${chosen_url}${NC}"
+        if [ "${email_enabled}" != "true" ]; then
+            echo -e "${RED}Email OTP belum dikonfigurasi di PC/Laptop.${NC}" >&2
+            echo -e "Jalankan ${CYAN}sudo control-access --setup-email${NC} di PC/Laptop terlebih dahulu." >&2
+            exit 1
+        fi
+        if [ -z "${supplied_rac}" ]; then
+            local prompt_email="${MRC_EMAIL:-}"
+            local input_email=""
+            if [ -n "${prompt_email}" ]; then
+                read -r -p "Masukkan Email terdaftar [${prompt_email}]: " input_email
+                input_email="${input_email:-${prompt_email}}"
+            else
+                read -r -p "Masukkan Email terdaftar: " input_email
+            fi
+            input_email="$(printf '%s' "${input_email}" | tr -d '[:space:]')"
+            if [ -z "${input_email}" ]; then
+                echo -e "${RED}Alamat email tidak boleh kosong.${NC}" >&2
+                exit 1
+            fi
+            save_config "${input_email}" ${MRC_URLS}
+            echo -e "Mengirim 6-digit RAC ke ${CYAN}${input_email}${NC}..."
+            local email_payload email_raw email_http email_body email_msg
+            email_payload="$(printf '{"email":"%s"}' "${input_email//\"/}")"
+            if ! email_raw="$(http_post_json "${chosen_url}/api/pairing/email-code" "${email_payload}")"; then
+                echo -e "${RED}Gagal menghubungi server untuk mengirim Email RAC.${NC}" >&2
+                exit 1
+            fi
+            email_http="$(printf '%s\n' "${email_raw}" | sed -n 's/^HTTP_STATUS://p' | tail -n 1)"
+            email_body="$(printf '%s\n' "${email_raw}" | sed '/^HTTP_STATUS:/d')"
+            email_msg="$(json_extract_str "message" "${email_body}")"
+            if [ "${email_http}" != "200" ]; then
+                echo -e "${RED}Gagal mengirim Email RAC (HTTP ${email_http}): ${email_msg}${NC}" >&2
+                exit 1
+            fi
+            echo -e "${GREEN}${email_msg:-Kode 6-digit RAC telah dikirim ke email Anda.}${NC}"
+            read -r -p "Masukkan 6-digit RAC dari Email: " supplied_rac
+        fi
+    else
+        echo -e "${GREEN}${BOLD}   Mobile-RC • Local LAN Access (Host RAC)${NC}"
+        echo -e "${CYAN}====================================================${NC}"
+        echo -e "   Server : ${CYAN}${chosen_url}${NC}"
+        echo -e "   Info   : Jalankan ${YELLOW}sudo control-access${NC} di PC/Laptop Anda."
+        if [ -z "${supplied_rac}" ]; then
+            read -r -p "Masukkan 6-digit RAC dari PC/Laptop: " supplied_rac
+        fi
+    fi
+
+    supplied_rac="$(printf '%s' "${supplied_rac}" | tr -d '[:space:]')"
+    if [ -z "${supplied_rac}" ]; then
+        echo -e "${RED}Kode RAC tidak boleh kosong.${NC}" >&2
         exit 1
     fi
 
-    echo ""
-    echo -e "${CYAN}============================================${NC}"
-    echo -e "${GREEN}${BOLD}   🔑 Mobile-RC • Random Access Code        ${NC}"
-    echo -e "${CYAN}============================================${NC}"
-    echo -e "   Code    : ${YELLOW}${BOLD}${code}${NC}"
-    echo -e "   Valid   : ${ttl:-180}s (single-use)"
-    echo -e "   URL     : ${CYAN}${chosen_url}${NC}"
-    if [ -n "${tunnel_url}" ]; then
-        echo -e "   Tunnel  : ${CYAN}${tunnel_url}${NC}"
+    local login_payload login_raw login_http login_body handoff_token err_msg
+    login_payload="$(printf '{"pin":"%s","handoff":true}' "${supplied_rac//\"/}")"
+    if ! login_raw="$(http_post_json "${chosen_url}/api/login" "${login_payload}")"; then
+        echo -e "${RED}Gagal memverifikasi RAC ke ${chosen_url}.${NC}" >&2
+        exit 1
     fi
-    echo -e "${CYAN}============================================${NC}"
+    login_http="$(printf '%s\n' "${login_raw}" | sed -n 's/^HTTP_STATUS://p' | tail -n 1)"
+    login_body="$(printf '%s\n' "${login_raw}" | sed '/^HTTP_STATUS:/d')"
 
-    if command -v termux-clipboard-set >/dev/null 2>&1; then
-        printf '%s' "${code}" | termux-clipboard-set 2>/dev/null || true
-        echo -e "${GREEN}✓ Code copied to Android clipboard.${NC}"
+    if [ "${login_http}" != "200" ]; then
+        err_msg="$(json_extract_str "message" "${login_body}")"
+        echo -e "${RED}Verifikasi gagal (HTTP ${login_http}): ${err_msg:-Kode RAC salah atau kedaluwarsa}${NC}" >&2
+        exit 1
     fi
 
-    if [ "${open_browser}" -eq 1 ]; then
-        if command -v termux-open-url >/dev/null 2>&1; then
-            termux-open-url "${chosen_url}/?v=2" 2>/dev/null || true
-        elif command -v am >/dev/null 2>&1; then
-            am start -a android.intent.action.VIEW -d "${chosen_url}/?v=2" >/dev/null 2>&1 || true
-        fi
+    handoff_token="$(json_extract_str "handoff_token" "${login_body}")"
+    local target_url="${chosen_url}/?handoff=${handoff_token}"
+    echo -e "${GREEN}RAC terverifikasi! Membuka dashboard secara otomatis...${NC}"
+    if ! open_url_in_browser "${target_url}"; then
+        echo -e "Buka URL ini di browser HP Anda:"
+        echo -e "  ${CYAN}${target_url}${NC}"
     fi
-    echo ""
+    echo -e "${CYAN}====================================================${NC}\n"
 }
 
 case "${1:-}" in
@@ -268,5 +371,5 @@ case "${1:-}" in
     add-url) shift; cmd_add_url "$@" ;;
     status) cmd_status ;;
     -h|--help) usage ;;
-    *) cmd_request "$@" ;;
+    *) cmd_connect "$@" ;;
 esac

@@ -29,9 +29,30 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 
-CONFIG_FILE = os.environ.get("MRC_CONFIG_DIR", "/opt/mobile-rc") + "/config.json"
+def _default_config_dir():
+    env_dir = os.environ.get("MRC_CONFIG_DIR", "").strip()
+    if env_dir:
+        return env_dir
+    if os.path.exists("/etc/NIXOS") or (
+        os.path.isdir("/var/lib/mobile-rc") and not os.path.exists("/opt/mobile-rc/config.json")
+    ):
+        return "/var/lib/mobile-rc"
+    return "/opt/mobile-rc"
+
+
+def _find_bin(name):
+    extra = (
+        f"{os.environ.get('PATH', '')}:"
+        "/run/wrappers/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:"
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    )
+    return shutil.which(name, path=extra)
+
+
+CONFIG_FILE = os.path.join(_default_config_dir(), "config.json")
 DEFAULT_PORT = int(os.environ.get("MRC_PORT", "8000"))
 _EMAIL_RE = re.compile(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$")
 
@@ -64,6 +85,25 @@ def get_lan_ips():
     return ips
 
 
+def get_mac_addresses():
+    macs = []
+    net_dir = "/sys/class/net"
+    if os.path.isdir(net_dir):
+        for iface in sorted(os.listdir(net_dir)):
+            if iface == "lo":
+                continue
+            addr_path = os.path.join(net_dir, iface, "address")
+            if os.path.exists(addr_path):
+                try:
+                    with open(addr_path, "r", encoding="utf-8") as f:
+                        mac = f.read().strip().lower()
+                    if mac and mac != "00:00:00:00:00:00":
+                        macs.append({"iface": iface, "mac": mac})
+                except OSError:
+                    pass
+    return macs
+
+
 def load_config():
     if os.geteuid() != 0 and not os.access(CONFIG_FILE, os.R_OK):
         print(f"{RED}Permission denied reading {CONFIG_FILE}. Run with: sudo control-access{NC}", file=sys.stderr)
@@ -76,32 +116,29 @@ def load_config():
 
 
 def print_termux_setup(cfg, port):
-    token = str(cfg.get("termux_token") or "").strip()
-    if not token:
-        print(f"{RED}No termux_token found in {CONFIG_FILE}. Run sudo ./update.sh first.{NC}", file=sys.stderr)
-        sys.exit(1)
-
     ips = get_lan_ips()
     urls = [f"http://{ip}:{port}" for ip in ips]
-    urls.append(f"http://127.0.0.1:{port}")
+    if not urls:
+        urls.append(f"http://127.0.0.1:{port}")
     primary = urls[0]
     url_args = " ".join(shlex.quote(u) for u in urls)
 
     cmd = (
+        f"rm -f \"$PREFIX/bin/kontrol-laptop\" && "
         f"mkdir -p \"$PREFIX/bin\" && "
         f"curl -fsSL {shlex.quote(primary + '/assets/control-access')} -o \"$PREFIX/bin/control-access\" && "
         f"chmod +x \"$PREFIX/bin/control-access\" && "
-        f"control-access init {shlex.quote(token)} {url_args}"
+        f"control-access init {url_args}"
     )
 
     print(f"\n{CYAN}===================================================={NC}")
-    print(f"{GREEN}{BOLD}   📱 Termux One-Line Setup (`control-access`)      {NC}")
+    print(f"{GREEN}{BOLD}   Termux Setup (`control-access` — Token-Free RAC) {NC}")
     print(f"{CYAN}===================================================={NC}")
-    print("Paste this command into Termux on your smartphone:\n")
+    print("Paste this command into Termux on your smartphone (no secret token stored on phone):\n")
     print(f"{YELLOW}{cmd}{NC}\n")
-    print("After setup, simply type:")
-    print(f"  {CYAN}control-access{NC}         -> generate random 6-digit code")
-    print(f"  {CYAN}control-access --open{NC}  -> generate code & open browser")
+    print("How it works when you type 'control-access' in Termux:")
+    print(f"  - {CYAN}Local LAN{NC}  : Enter 6-digit RAC from 'sudo control-access' on PC -> auto-opens unlocked dashboard")
+    print(f"  - {CYAN}Non-Local{NC}  : Enter registered Email -> receives 6-digit RAC via Email -> auto-opens unlocked dashboard")
     print(f"{CYAN}===================================================={NC}\n")
 
 
@@ -149,6 +186,54 @@ def request_code(cfg, port):
     if tunnel_url:
         print(f"   Tunnel  : {CYAN}{tunnel_url}{NC}")
     print(f"{CYAN}============================================{NC}\n")
+
+
+def print_pair_info(cfg, port):
+    token = str(cfg.get("termux_token") or "").strip()
+    if not token:
+        print(f"{RED}No termux_token found in {CONFIG_FILE}. Run sudo ./update.sh first.{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/pairing/code",
+        data=b"{}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"{RED}Could not request live pairing info from port {port}: {e}{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    code = data.get("code", "")
+    ttl = data.get("expires_in", 180)
+    ips = data.get("ips") or get_lan_ips()
+    macs = get_mac_addresses()
+    primary_host = ips[0] if ips else "127.0.0.1"
+    primary_mac = macs[0]["mac"] if macs else ""
+    pair_uri = urllib.parse.urlencode({
+        "host": primary_host,
+        "port": str(port),
+        "code": code,
+        "mac": primary_mac,
+    })
+
+    print(f"\n{CYAN}===================================================={NC}")
+    print(f"{GREEN}{BOLD}   Mobile-RC • App & Device Pairing Info{NC}")
+    print(f"{CYAN}===================================================={NC}")
+    print(f"   One-Time Code : {YELLOW}{BOLD}{code}{NC} (valid {ttl}s)")
+    print(f"   Primary URL   : {CYAN}http://{primary_host}:{port}{NC}")
+    for extra in ips[1:]:
+        print(f"   Alt LAN URL   : {CYAN}http://{extra}:{port}{NC}")
+    for m in macs:
+        print(f"   NIC MAC (WoL) : {CYAN}{m['iface']} -> {m['mac']}{NC}")
+    print(f"   Pair URI      : {YELLOW}mobilerc://pair?{pair_uri}{NC}")
+    print(f"{CYAN}===================================================={NC}\n")
 
 
 def _norm_email(val):
@@ -297,11 +382,26 @@ def setup_email(cfg):
         send_test_email(cfg)
 
 
+def _runit_paths():
+    sv_base = next((d for d in ("/etc/sv", "/etc/runit/sv") if os.path.isdir(os.path.join(d, "mobile-rc"))), None)
+    service_base = next((d for d in ("/var/service", "/run/runit/service", "/etc/service") if os.path.isdir(d)), None)
+    if sv_base and service_base:
+        return os.path.join(sv_base, "mobile-rc"), os.path.join(service_base, "mobile-rc")
+    return None, None
+
+
 def _detect_init_mode():
-    if shutil.which("systemctl") and os.path.isdir("/run/systemd/system") and os.path.exists("/etc/systemd/system/mobile-rc.service"):
+    if _find_bin("systemctl") and os.path.isdir("/run/systemd/system") and (
+        os.path.exists("/etc/systemd/system/mobile-rc.service")
+        or os.path.exists("/etc/static/systemd/system/mobile-rc.service")
+    ):
         return "systemd"
-    if shutil.which("rc-service") and os.path.exists("/etc/init.d/mobile-rc"):
+    if _find_bin("rc-service") and os.path.exists("/etc/init.d/mobile-rc"):
         return "openrc"
+    if _find_bin("dinitctl") and os.path.exists("/etc/dinit.d/mobile-rc"):
+        return "dinit"
+    if _find_bin("sv") and _runit_paths()[0] is not None:
+        return "runit"
     return "nohup"
 
 
@@ -315,13 +415,27 @@ def _service_state(mode):
     elif mode == "openrc":
         running = subprocess.run(["rc-service", "mobile-rc", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
         en = os.path.exists("/etc/runlevels/default/mobile-rc")
-        if not en and shutil.which("rc-update"):
+        if not en and _find_bin("rc-update"):
             res = subprocess.run(["rc-update", "show", "default"], capture_output=True, text=True, check=False)
             if res.returncode == 0 and "mobile-rc" in res.stdout:
                 en = True
         autostart = "enabled" if en else "disabled"
+    elif mode == "dinit":
+        res = subprocess.run(["dinitctl", "status", "mobile-rc"], capture_output=True, text=True, check=False)
+        out_u = (res.stdout or "").upper()
+        running = res.returncode == 0 and ("STARTED" in out_u or "RUNNING" in out_u)
+        autostart = "enabled" if os.path.exists("/etc/dinit.d/boot.d/mobile-rc") else "disabled"
+    elif mode == "runit":
+        _, svc_link = _runit_paths()
+        sv_dir, _ = _runit_paths()
+        if svc_link and os.path.lexists(svc_link):
+            res = subprocess.run(["sv", "status", svc_link], capture_output=True, text=True, check=False)
+            running = res.returncode == 0 and "run:" in (res.stdout or "").lower()
+            autostart = "disabled" if os.path.exists(os.path.join(sv_dir, "down")) else "enabled"
+        else:
+            autostart = "disabled"
     else:
-        if shutil.which("pgrep"):
+        if _find_bin("pgrep"):
             running = subprocess.run(["pgrep", "-f", "/opt/mobile-rc/server.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
     return running, autostart
 
@@ -349,13 +463,39 @@ def manage_boot_autostart(enable):
     _require_root_for_service("--enable" if enable else "--disable")
     mode = _detect_init_mode()
     if mode == "systemd":
+        if os.path.exists("/etc/NIXOS"):
+            print(
+                f"{YELLOW}NixOS systemd unit is declarative. Set services.mobile-rc.enable in your NixOS config and run sudo nixos-rebuild switch.{NC}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         action = "enable" if enable else "disable"
         res = subprocess.run(["systemctl", action, "mobile-rc.service"], capture_output=True, text=True, check=False)
     elif mode == "openrc":
         args = ["rc-update", "add", "mobile-rc", "default"] if enable else ["rc-update", "del", "mobile-rc", "default"]
         res = subprocess.run(args, capture_output=True, text=True, check=False)
+    elif mode == "dinit":
+        args = ["dinitctl", "enable" if enable else "disable", "mobile-rc"]
+        res = subprocess.run(args, capture_output=True, text=True, check=False)
+    elif mode == "runit":
+        sv_dir, svc_link = _runit_paths()
+        if not sv_dir or not svc_link:
+            print(f"{RED}runit service directory not found.{NC}", file=sys.stderr)
+            sys.exit(1)
+        down_file = os.path.join(sv_dir, "down")
+        if enable:
+            if os.path.exists(down_file):
+                os.remove(down_file)
+            if not os.path.lexists(svc_link):
+                os.symlink(sv_dir, svc_link)
+        else:
+            if not os.path.lexists(svc_link):
+                os.symlink(sv_dir, svc_link)
+            fd = os.open(down_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            os.close(fd)
+        res = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     else:
-        print(f"{YELLOW}No systemd or OpenRC unit found; nohup mode does not register boot auto-start.{NC}")
+        print(f"{YELLOW}No supported init service found; nohup mode does not register boot auto-start.{NC}")
         return
     if res.returncode != 0:
         err = (res.stderr or res.stdout or "").strip()
@@ -381,8 +521,27 @@ def manage_runtime_service(action):
         if res.returncode != 0:
             print(f"{RED}rc-service {action} failed: {(res.stderr or res.stdout).strip()}{NC}", file=sys.stderr)
             sys.exit(1)
+    elif mode == "dinit":
+        if action == "stop" and not _service_state(mode)[0]:
+            print(f"{YELLOW}Mobile-RC service is already stopped.{NC}")
+            return
+        res = subprocess.run(["dinitctl", action, "mobile-rc"], capture_output=True, text=True, check=False)
+        if res.returncode != 0:
+            print(f"{RED}dinitctl {action} failed: {(res.stderr or res.stdout).strip()}{NC}", file=sys.stderr)
+            sys.exit(1)
+    elif mode == "runit":
+        sv_dir, svc_link = _runit_paths()
+        if action == "stop" and not _service_state(mode)[0]:
+            print(f"{YELLOW}Mobile-RC service is already stopped.{NC}")
+            return
+        if not os.path.lexists(svc_link):
+            os.symlink(sv_dir, svc_link)
+        res = subprocess.run(["sv", action, svc_link], capture_output=True, text=True, check=False)
+        if res.returncode != 0:
+            print(f"{RED}sv {action} failed: {(res.stderr or res.stdout).strip()}{NC}", file=sys.stderr)
+            sys.exit(1)
     else:
-        if action in ("stop", "restart") and shutil.which("pkill"):
+        if action in ("stop", "restart") and _find_bin("pkill"):
             subprocess.run(["pkill", "-f", "/opt/mobile-rc/server.py"], check=False)
         if action in ("start", "restart"):
             env = os.environ.copy()
@@ -409,6 +568,7 @@ def manage_runtime_service(action):
 def main():
     parser = argparse.ArgumentParser(description="Mobile-RC pairing, Email OTP & service control CLI")
     parser.add_argument("--setup-termux", action="store_true", help="Show 1-line setup command for Termux")
+    parser.add_argument("--pair-info", action="store_true", help="Show LAN URLs, NIC MACs (WoL) and app pairing URI")
     parser.add_argument("--setup-email", action="store_true", help="Configure Gmail/SMTP bot & allowed emails for online OTP")
     parser.add_argument("--test-email", action="store_true", help="Send a test email using saved Email OTP settings")
     parser.add_argument("--status", action="store_true", help="Show Mobile-RC service runtime and boot auto-start status")
@@ -441,6 +601,8 @@ def main():
     cfg = load_config()
     if args.setup_termux:
         print_termux_setup(cfg, args.port)
+    elif args.pair_info:
+        print_pair_info(cfg, args.port)
     elif args.setup_email:
         setup_email(cfg)
     elif args.test_email:

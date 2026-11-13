@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Mobile-RC (Linux Mobile Control Center) — Pure Python Stdlib Server."""
 
+from collections import deque
 from email.message import EmailMessage
 from http import HTTPStatus
+import hashlib
 import http.cookies
 import http.server
 import hmac
@@ -28,6 +30,8 @@ import urllib.parse
 import urllib.request
 
 PORT = int(os.environ.get("MRC_PORT", "8000"))
+DISCOVERY_PORT = int(os.environ.get("MRC_DISCOVERY_PORT", "8001"))
+DISCOVERY_ENABLED = os.environ.get("MRC_DISCOVERY", "1").strip().lower() not in ("0", "false", "no")
 CONFIG_DIR = os.environ.get("MRC_CONFIG_DIR", "/opt/mobile-rc")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 PIN_FILE = os.path.join(CONFIG_DIR, "pin.txt")
@@ -40,15 +44,19 @@ SESSION_TTL_SEC = 86400
 CODE_TTL_SEC = max(30, min(600, int(os.environ.get("MRC_CODE_TTL", "180"))))
 LOGIN_MAX_FAILS = 5
 LOGIN_LOCKOUT_SEC = 120
+FEEDBACK_TARGET_EMAIL = os.environ.get("MRC_FEEDBACK_EMAIL", "brypra4@gmail.com").strip() or "brypra4@gmail.com"
+FEEDBACK_WEBHOOK_URL = os.environ.get("MRC_FEEDBACK_WEBHOOK", "").strip()
 
 LAUNCH_PRESETS = {
     "terminal": [
-        ["konsole"],
         ["kitty"],
+        ["konsole"],
         ["alacritty"],
         ["foot"],
         ["wezterm"],
+        ["ghostty"],
         ["gnome-terminal"],
+        ["xfce4-terminal"],
         ["xterm"],
     ],
     "youtube": [["xdg-open", "https://youtube.com"]],
@@ -66,27 +74,45 @@ HYPR_PRESETS = {
     "fullscreen": [
         ["hyprctl", "dispatch", "hl.dsp.window.fullscreen({ mode = 0 })"],
         ["hyprctl", "dispatch", "fullscreen", "0"],
+        ["niri", "msg", "action", "fullscreen-window"],
         ["swaymsg", "fullscreen", "toggle"],
+        ["riverctl", "toggle-fullscreen"],
+        ["qdbus6", "org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", "Window Fullscreen"],
+        ["qdbus", "org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", "Window Fullscreen"],
+        ["wmctrl", "-r", ":ACTIVE:", "-b", "toggle,fullscreen"],
         ["xdotool", "key", "F11"],
     ],
     "killactive": [
         ["hyprctl", "dispatch", "hl.dsp.window.close()"],
         ["hyprctl", "dispatch", "killactive"],
+        ["niri", "msg", "action", "close-window"],
         ["swaymsg", "kill"],
+        ["riverctl", "close"],
+        ["qdbus6", "org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", "Window Close"],
+        ["qdbus", "org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", "Window Close"],
+        ["kdotool", "getactivewindow", "windowclose"],
+        ["wmctrl", "-c", ":ACTIVE:"],
         ["xdotool", "getactivewindow", "windowclose"],
     ],
     "dpms_toggle": [
         ["hyprctl", "dispatch", 'hl.dsp.dpms({ action = "toggle" })'],
         ["hyprctl", "dispatch", "dpms", "toggle"],
+        ["niri", "msg", "action", "power-off-monitors"],
         ["swaymsg", "output", "*", "dpms", "toggle"],
         ["wlopm", "--toggle", "*"],
+        ["qdbus6", "org.kde.kglobalaccel", "/component/org_kde_powerdevil", "invokeShortcut", "Turn Off Screen"],
+        ["qdbus", "org.kde.kglobalaccel", "/component/org_kde_powerdevil", "invokeShortcut", "Turn Off Screen"],
+        ["kscreen-doctor", "--dpms", "off"],
         ["xset", "dpms", "force", "off"],
     ],
 }
 
+_LAST_RIVER_TAG = 1
+
 _CONFIG_LOCK = threading.Lock()
 _AUTH_LOCK = threading.Lock()
 _SESSIONS = {}  # token -> {"expires": float, "csrf": str, "ip": str}
+_HANDOFF_TICKETS = {}  # handoff_token -> {"expires": float, "ip": str}
 _LOGIN_ATTEMPTS = {}  # ip -> {"fails": int, "locked_until": float}
 _PAIRING_ATTEMPTS = {}  # ip -> {"fails": int, "locked_until": float}
 _EMAIL_REQ_ATTEMPTS = {}  # ip -> {"fails": int, "locked_until": float}
@@ -105,6 +131,23 @@ _TUNNEL_STATUS = "stopped"
 _TUNNEL_AUTO = None  # Initialized lazily from env / config.json
 
 _LAST_CPU = None
+_FEEDBACK_HISTORY = {}  # ip -> list[float timestamps]
+_NET_LAST = None
+_PROC_LAST = None
+_DISTRO_SCAN_LOCK = threading.Lock()
+_DISTRO_CACHE = {"safe": None, "deep": None}
+_AUDIT_LOG = deque(maxlen=150)
+
+
+def record_audit_event(level, message):
+    """Append a structured runtime/security event to the bounded ring buffer."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    _AUDIT_LOG.append({
+        "ts": ts,
+        "source": "mobile-rc",
+        "level": str(level).upper(),
+        "message": str(message),
+    })
 
 
 class _PayloadTooLargeError(Exception):
@@ -362,25 +405,8 @@ def _is_allowed_email(email_norm, allowed_list):
     return matched
 
 
-def send_otp_email(to_email, code, ttl, client_hint="", settings=None):
-    """Send a single-use 6-digit login code via configured SMTP server (e.g. Gmail App Password)."""
-    cfg = settings or get_email_otp_settings()
-    if not cfg.get("configured"):
-        return False, "Email OTP is not configured on host"
-
-    host_name = platform.node() or "Linux PC"
-    msg = EmailMessage()
-    msg["Subject"] = f"[Mobile-RC] Access Code: {code}"
-    msg["From"] = cfg["smtp_user"]
-    msg["To"] = to_email
-    msg.set_content(
-        f"Your Mobile-RC one-time access code for {host_name} is:\n\n"
-        f"    {code}\n\n"
-        f"Valid for {ttl} seconds (single-use).\n"
-        f"Requested from: {client_hint or 'Remote browser'}\n\n"
-        f"If you did not request this code, someone attempted to access your remote dashboard URL.\n"
-    )
-
+def _deliver_smtp_message(cfg, msg, context_label="Email"):
+    """Deliver an EmailMessage over configured SMTP TLS or SSL transport."""
     try:
         ctx = ssl.create_default_context()
         if cfg["smtp_port"] == 465:
@@ -396,8 +422,211 @@ def send_otp_email(to_email, code, ttl, client_hint="", settings=None):
                 srv.send_message(msg)
         return True, ""
     except Exception as e:
-        print(f"[Mobile-RC] Email OTP send error ({cfg['smtp_host']}:{cfg['smtp_port']}): {e}", file=sys.stderr)
+        print(f"[Mobile-RC] {context_label} SMTP error ({cfg['smtp_host']}:{cfg['smtp_port']}): {e}", file=sys.stderr)
         return False, str(e)
+
+
+def send_otp_email(to_email, code, ttl, client_hint="", settings=None):
+    """Send a single-use 6-digit login code via configured SMTP server (e.g. Gmail App Password)."""
+    cfg = settings or get_email_otp_settings()
+    if not cfg.get("configured"):
+        return False, "Email OTP is not configured on host"
+
+    host_name = platform.node() or "Linux Host"
+    msg = EmailMessage()
+    msg["Subject"] = f"[Mobile-RC] Access Code: {code}"
+    msg["From"] = cfg["smtp_user"]
+    msg["To"] = to_email
+    msg.set_content(
+        f"Your Mobile-RC one-time access code for {host_name} is:\n\n"
+        f"    {code}\n\n"
+        f"Valid for {ttl} seconds (single-use).\n"
+        f"Requested from: {client_hint or 'Remote browser'}\n\n"
+        f"If you did not request this code, someone attempted to access your remote dashboard URL.\n"
+    )
+    return _deliver_smtp_message(cfg, msg, "Email OTP")
+
+
+def build_feedback_fallbacks(category, subject, message, sysinfo_text=""):
+    """Build safe mailto and GitHub Issue fallback URLs when no relay/SMTP is configured."""
+    cat_title = category.title()
+    full_subject = f"[Mobile-RC {cat_title}] {subject}"
+    body_lines = [message]
+    if sysinfo_text:
+        body_lines.extend(["", "--- System Info ---", sysinfo_text])
+    full_body = "\n".join(body_lines)
+    mailto_url = (
+        f"mailto:{urllib.parse.quote(FEEDBACK_TARGET_EMAIL, safe='@')}"
+        f"?subject={urllib.parse.quote(full_subject)}"
+        f"&body={urllib.parse.quote(full_body)}"
+    )
+    github_url = (
+        "https://github.com/739202873/linux-mobile-remote-control/issues/new"
+        f"?title={urllib.parse.quote(full_subject)}"
+        f"&body={urllib.parse.quote(full_body)}"
+    )
+    return mailto_url, github_url
+
+
+def send_feedback_report(category, subject, message, reply_to="", include_sysinfo=False):
+    """Deliver user suggestion/bug report via local SMTP, optional HTTPS webhook, or fallback links."""
+    sysinfo_text = ""
+    if include_sysinfo:
+        os_info = get_os_info()
+        comp = get_active_compositor(get_desktop_env()) or "unknown"
+        sysinfo_text = (
+            f"OS: {os_info.get('name', 'Linux')}\n"
+            f"Kernel: {os_info.get('kernel', '-')}\n"
+            f"Init: {detect_init_system()}\n"
+            f"Compositor: {comp}"
+        )
+
+    smtp_cfg = get_email_otp_settings()
+    has_smtp_bot = bool(
+        smtp_cfg.get("enabled")
+        and smtp_cfg.get("smtp_host")
+        and smtp_cfg.get("smtp_user")
+        and smtp_cfg.get("smtp_pass")
+    )
+    if has_smtp_bot:
+        msg = EmailMessage()
+        msg["Subject"] = f"[Mobile-RC {category.title()}] {subject}"
+        msg["From"] = smtp_cfg["smtp_user"]
+        msg["To"] = FEEDBACK_TARGET_EMAIL
+        if reply_to:
+            msg["Reply-To"] = reply_to
+        body = [f"Category: {category}", f"Subject: {subject}"]
+        if reply_to:
+            body.append(f"Reply-To: {reply_to}")
+        body.extend(["", message])
+        if sysinfo_text:
+            body.extend(["", "--- Host Environment ---", sysinfo_text])
+        msg.set_content("\n".join(body) + "\n")
+        ok, err = _deliver_smtp_message(smtp_cfg, msg, "Feedback")
+        if ok:
+            record_audit_event("INFO", f"Sent {category} feedback via local SMTP to {FEEDBACK_TARGET_EMAIL}")
+            return {"ok": True, "delivery": "smtp", "message": f"Feedback sent to {FEEDBACK_TARGET_EMAIL}!"}
+
+    webhook = FEEDBACK_WEBHOOK_URL
+    if not webhook:
+        cfg_wh = str(get_config().get("feedback_webhook") or "").strip()
+        if cfg_wh:
+            webhook = cfg_wh
+    if webhook.startswith(("https://", "http://")):
+        payload = json.dumps({
+            "source": "mobile-rc",
+            "category": category,
+            "subject": subject,
+            "message": message,
+            "reply_to": reply_to,
+            "target_email": FEEDBACK_TARGET_EMAIL,
+            "sysinfo": sysinfo_text,
+        }).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                webhook,
+                data=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if 200 <= resp.status < 300:
+                    record_audit_event("INFO", f"Sent {category} feedback via configured webhook")
+                    return {"ok": True, "delivery": "webhook", "message": "Feedback delivered via relay webhook!"}
+        except Exception as e:
+            record_audit_event("WARN", f"Feedback webhook delivery failed: {e}")
+
+    mailto_url, github_url = build_feedback_fallbacks(category, subject, message, sysinfo_text)
+    return {
+        "ok": False,
+        "delivery": "fallback",
+        "target_email": FEEDBACK_TARGET_EMAIL,
+        "mailto": mailto_url,
+        "github_issue": github_url,
+        "message": "Local SMTP/webhook is not configured on this host; use the Email App or GitHub Issue button below.",
+    }
+
+
+def _hash_device_token(raw_token):
+    return hashlib.sha256(str(raw_token).encode("utf-8")).hexdigest()
+
+
+def register_mobile_device(device_name):
+    """Create and persist a hashed long-lived Bearer device token in config.json (0600)."""
+    safe_name = re.sub(r"[\r\n\t]+", " ", str(device_name or "Android Device")).strip()[:64] or "Android Device"
+    raw_token = secrets.token_urlsafe(32)
+    dev_id = secrets.token_hex(8)
+    now = int(time.time())
+    cfg = get_config()
+    devices = cfg.get("mobile_devices")
+    if not isinstance(devices, list):
+        devices = []
+    devices.append({
+        "id": dev_id,
+        "name": safe_name,
+        "token_hash": _hash_device_token(raw_token),
+        "created_at": now,
+        "last_seen": now,
+    })
+    cfg["mobile_devices"] = devices[-25:]
+    save_config(cfg)
+    record_audit_event("INFO", f"Paired mobile device '{safe_name}' (id={dev_id})")
+    return dev_id, raw_token
+
+
+def verify_mobile_device_token(raw_token):
+    """Verify Bearer device token against stored SHA-256 digests cleanly."""
+    if not raw_token or len(raw_token) < 16:
+        return None
+    supplied_hash = _hash_device_token(raw_token)
+    cfg = get_config()
+    devices = cfg.get("mobile_devices")
+    if not isinstance(devices, list):
+        return None
+    for idx, dev in enumerate(devices):
+        if not isinstance(dev, dict):
+            continue
+        expected_hash = str(dev.get("token_hash") or "")
+        if expected_hash and hmac.compare_digest(supplied_hash, expected_hash):
+            now = int(time.time())
+            if now - int(dev.get("last_seen") or 0) > 300:
+                dev["last_seen"] = now
+                devices[idx] = dev
+                save_config(cfg)
+            return dev
+    return None
+
+
+def list_mobile_devices():
+    """Return paired device metadata without exposing token hashes."""
+    cfg = get_config()
+    devices = cfg.get("mobile_devices")
+    out = []
+    if isinstance(devices, list):
+        for dev in devices:
+            if not isinstance(dev, dict):
+                continue
+            out.append({
+                "id": str(dev.get("id") or ""),
+                "name": str(dev.get("name") or "Mobile Device"),
+                "created_at": int(dev.get("created_at") or 0),
+                "last_seen": int(dev.get("last_seen") or 0),
+            })
+    return out
+
+
+def revoke_mobile_device(dev_id):
+    cfg = get_config()
+    devices = cfg.get("mobile_devices")
+    if not isinstance(devices, list):
+        return False
+    remaining = [d for d in devices if isinstance(d, dict) and str(d.get("id") or "") != str(dev_id)]
+    if len(remaining) == len(devices):
+        return False
+    cfg["mobile_devices"] = remaining
+    save_config(cfg)
+    record_audit_event("INFO", f"Revoked mobile device id={dev_id}")
+    return True
 
 
 def _store_one_time_code(code, ttl=CODE_TTL_SEC, source="cli", email=""):
@@ -418,10 +647,22 @@ def issue_one_time_code(source="cli", email=""):
     return code, CODE_TTL_SEC
 
 
-def _verify_login_code(supplied_pin):
-    """Verify login code against active one-time code or static PIN."""
+def _verify_login_code(supplied_pin, require_email=False):
+    """Verify login code against active one-time code (Email RAC for remote, CLI/Email RAC for local) or static PIN."""
     global _ACTIVE_CODE
     now = time.time()
+    if require_email:
+        with _AUTH_LOCK:
+            if not _ACTIVE_CODE or _ACTIVE_CODE.get("source") != "email":
+                return False, "missing"
+            if now >= _ACTIVE_CODE["expires"]:
+                _ACTIVE_CODE = None
+                return False, "expired"
+            if hmac.compare_digest(supplied_pin, _ACTIVE_CODE["code"]):
+                _ACTIVE_CODE = None
+                return True, "ok"
+            return False, "invalid"
+
     if get_pin_mode() == "static":
         with _AUTH_LOCK:
             if _ACTIVE_CODE and _ACTIVE_CODE.get("source") == "email":
@@ -481,10 +722,38 @@ def set_pin(new_pin):
     _write_secure_file(PIN_FILE, pin + "\n", 0o600)
 
 
+def _merge_path_dirs(*groups):
+    """Merge colon-separated PATH groups while preserving priority order and uniqueness."""
+    parts = []
+    seen = set()
+    for group in groups:
+        for entry in str(group or "").split(":"):
+            entry = entry.strip()
+            if entry and entry not in seen:
+                seen.add(entry)
+                parts.append(entry)
+    return ":".join(parts)
+
+
+def get_system_path():
+    """Return an expanded PATH covering both FHS and NixOS system/wrapper locations."""
+    return _merge_path_dirs(
+        os.environ.get("PATH", ""),
+        "/run/wrappers/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    )
+
+
+def find_bin(name, search_path=None):
+    """Locate an executable in explicit/NixOS/FHS PATHs."""
+    return shutil.which(name, path=search_path or get_system_path())
+
+
 def run_cmd(cmd, timeout=8, shell=False):
     """Execute a system command cleanly without unintended shell expansion."""
     try:
         env = os.environ.copy()
+        env["PATH"] = get_system_path()
         env["LC_ALL"] = "C"
         res = subprocess.run(
             cmd,
@@ -501,8 +770,9 @@ def run_cmd(cmd, timeout=8, shell=False):
 
 def run_first_system_cmd(cmd_variants, timeout=8):
     """Run the first available root/system command variant using list args."""
+    sys_path = get_system_path()
     for cmd in cmd_variants:
-        if shutil.which(cmd[0]):
+        if find_bin(cmd[0], sys_path):
             rc, out, err = run_cmd(cmd, timeout=timeout, shell=False)
             if rc == 0:
                 return rc, out, err
@@ -512,11 +782,11 @@ def run_first_system_cmd(cmd_variants, timeout=8):
 def get_desktop_env():
     """Inspect active processes strictly owned by the target user for GUI session env."""
     username, uid, _, home = get_target_user_info()
+    session_path = ""
     env = {
         "HOME": home,
         "USER": username,
         "LOGNAME": username,
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:" + os.path.join(home, ".local/bin"),
         "LC_ALL": "C",
     }
 
@@ -526,9 +796,13 @@ def get_desktop_env():
         "XDG_RUNTIME_DIR=",
         "DBUS_SESSION_BUS_ADDRESS=",
         "HYPRLAND_INSTANCE_SIGNATURE=",
+        "NIRI_SOCKET=",
         "SWAYSOCK=",
         "XDG_CURRENT_DESKTOP=",
+        "XDG_SESSION_TYPE=",
         "KDE_FULL_SESSION=",
+        "QT_QPA_PLATFORM=",
+        "PATH=",
     )
     try:
         for pid in os.listdir("/proc"):
@@ -544,12 +818,24 @@ def get_desktop_env():
                 for item in raw.split("\0"):
                     if item.startswith(keys_to_grab):
                         k, _, v = item.partition("=")
-                        if v and k not in env:
+                        if not v:
+                            continue
+                        if k == "PATH":
+                            session_path = _merge_path_dirs(session_path, v)
+                        elif k not in env:
                             env[k] = v
             except Exception:
                 continue
     except Exception:
         pass
+
+    env["PATH"] = _merge_path_dirs(
+        session_path,
+        f"/run/wrappers/bin:/etc/profiles/per-user/{username}/bin:{home}/.nix-profile/bin:"
+        "/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin",
+        os.environ.get("PATH", ""),
+        f"{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    )
 
     runtime_dir = env.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
     if os.path.isdir(runtime_dir):
@@ -557,14 +843,29 @@ def get_desktop_env():
         bus_sock = os.path.join(runtime_dir, "bus")
         if os.path.exists(bus_sock):
             env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={bus_sock}")
+        try:
+            runtime_entries = sorted(os.listdir(runtime_dir))
+        except OSError:
+            runtime_entries = []
         if "WAYLAND_DISPLAY" not in env:
-            try:
-                for name in sorted(os.listdir(runtime_dir)):
-                    if name.startswith("wayland-") and not name.endswith(".lock"):
-                        env["WAYLAND_DISPLAY"] = name
+            for name in runtime_entries:
+                if name.startswith("wayland-") and not name.endswith(".lock"):
+                    env["WAYLAND_DISPLAY"] = name
+                    break
+        if "NIRI_SOCKET" not in env or not os.path.exists(env.get("NIRI_SOCKET", "")):
+            for name in reversed(runtime_entries):
+                if name.startswith("niri.") and name.endswith(".sock"):
+                    cand = os.path.join(runtime_dir, name)
+                    if os.path.exists(cand):
+                        env["NIRI_SOCKET"] = cand
                         break
-            except OSError:
-                pass
+        if "SWAYSOCK" not in env or not os.path.exists(env.get("SWAYSOCK", "")):
+            for name in reversed(runtime_entries):
+                if name.startswith("sway-ipc.") and name.endswith(".sock"):
+                    cand = os.path.join(runtime_dir, name)
+                    if os.path.exists(cand):
+                        env["SWAYSOCK"] = cand
+                        break
         hypr_dir = os.path.join(runtime_dir, "hypr")
         cur_his = env.get("HYPRLAND_INSTANCE_SIGNATURE", "")
         if os.path.isdir(hypr_dir) and (
@@ -579,6 +880,105 @@ def get_desktop_env():
                 pass
     env.setdefault("DISPLAY", ":0")
     return env
+
+
+def get_active_compositor(env):
+    """Best-effort identification of the active Wayland compositor or DE."""
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "hyprland"
+    if env.get("NIRI_SOCKET") and os.path.exists(env.get("NIRI_SOCKET", "")):
+        return "niri"
+    if env.get("SWAYSOCK") and os.path.exists(env.get("SWAYSOCK", "")):
+        return "sway"
+    desktop = str(env.get("XDG_CURRENT_DESKTOP", "")).lower()
+    if "niri" in desktop:
+        return "niri"
+    if "hyprland" in desktop:
+        return "hyprland"
+    if "sway" in desktop:
+        return "sway"
+    if "river" in desktop:
+        return "river"
+    if "kde" in desktop or "plasma" in desktop or env.get("KDE_FULL_SESSION"):
+        return "kde"
+    if "gnome" in desktop:
+        return "gnome"
+    return ""
+
+
+def get_window_action_cmds(act, env):
+    """Return ordered desktop commands for window/DPMS actions matching the active session."""
+    comp = get_active_compositor(env)
+    x11_fallbacks = {
+        "fullscreen": [["wmctrl", "-r", ":ACTIVE:", "-b", "toggle,fullscreen"], ["xdotool", "key", "F11"]],
+        "killactive": [["wmctrl", "-c", ":ACTIVE:"], ["xdotool", "getactivewindow", "windowclose"]],
+        "dpms_toggle": [["wlopm", "--toggle", "*"], ["xset", "dpms", "force", "off"]],
+    }
+    by_comp = {
+        "hyprland": {
+            "fullscreen": [
+                ["hyprctl", "dispatch", "hl.dsp.window.fullscreen({ mode = 0 })"],
+                ["hyprctl", "dispatch", "fullscreen", "0"],
+            ],
+            "killactive": [
+                ["hyprctl", "dispatch", "hl.dsp.window.close()"],
+                ["hyprctl", "dispatch", "killactive"],
+            ],
+            "dpms_toggle": [
+                ["hyprctl", "dispatch", 'hl.dsp.dpms({ action = "toggle" })'],
+                ["hyprctl", "dispatch", "dpms", "toggle"],
+                ["wlopm", "--toggle", "*"],
+            ],
+        },
+        "niri": {
+            "fullscreen": [["niri", "msg", "action", "fullscreen-window"]],
+            "killactive": [["niri", "msg", "action", "close-window"]],
+            "dpms_toggle": [["niri", "msg", "action", "power-off-monitors"], ["wlopm", "--toggle", "*"]],
+        },
+        "sway": {
+            "fullscreen": [["swaymsg", "fullscreen", "toggle"]],
+            "killactive": [["swaymsg", "kill"]],
+            "dpms_toggle": [["swaymsg", "output", "*", "dpms", "toggle"], ["wlopm", "--toggle", "*"]],
+        },
+        "river": {
+            "fullscreen": [["riverctl", "toggle-fullscreen"]],
+            "killactive": [["riverctl", "close"]],
+            "dpms_toggle": [["wlopm", "--toggle", "*"]],
+        },
+        "kde": {
+            "fullscreen": [
+                ["qdbus6", "org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", "Window Fullscreen"],
+                ["qdbus", "org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", "Window Fullscreen"],
+                [
+                    "dbus-send", "--session", "--dest=org.kde.kglobalaccel", "/component/kwin",
+                    "org.kde.kglobalaccel.Component.invokeShortcut", "string:Window Fullscreen",
+                ],
+            ],
+            "killactive": [
+                ["qdbus6", "org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", "Window Close"],
+                ["qdbus", "org.kde.kglobalaccel", "/component/kwin", "invokeShortcut", "Window Close"],
+                [
+                    "dbus-send", "--session", "--dest=org.kde.kglobalaccel", "/component/kwin",
+                    "org.kde.kglobalaccel.Component.invokeShortcut", "string:Window Close",
+                ],
+                ["kdotool", "getactivewindow", "windowclose"],
+            ],
+            "dpms_toggle": [
+                [
+                    "dbus-send", "--session", "--dest=org.kde.kglobalaccel", "/component/org_kde_powerdevil",
+                    "org.kde.kglobalaccel.Component.invokeShortcut", "string:Turn Off Screen",
+                ],
+                ["qdbus6", "org.kde.kglobalaccel", "/component/org_kde_powerdevil", "invokeShortcut", "Turn Off Screen"],
+                ["qdbus", "org.kde.kglobalaccel", "/component/org_kde_powerdevil", "invokeShortcut", "Turn Off Screen"],
+                ["kscreen-doctor", "--dpms", "off"],
+            ],
+        },
+    }
+    if comp in by_comp:
+        return by_comp[comp].get(act, []) + x11_fallbacks.get(act, [])
+    if comp == "gnome":
+        return x11_fallbacks.get(act, [])
+    return HYPR_PRESETS.get(act, [])
 
 
 def run_as_user(cmd, timeout=10, shell=False, input_text=None, background=False, discard_output=False):
@@ -628,8 +1028,9 @@ def run_as_user(cmd, timeout=10, shell=False, input_text=None, background=False,
 def run_first_available(cmd_variants, timeout=8, input_text=None, background=False, discard_output=False):
     """Execute the first available desktop command variant without shell expansion."""
     last_err = ""
+    search_path = get_desktop_env()["PATH"]
     for cmd in cmd_variants:
-        if not shutil.which(cmd[0]):
+        if not find_bin(cmd[0], search_path):
             continue
         rc, out, err = run_as_user(
             cmd,
@@ -646,11 +1047,67 @@ def run_first_available(cmd_variants, timeout=8, input_text=None, background=Fal
             "no such dispatcher",
             "unknown request",
             "couldn't connect",
+            "could not connect",
         ))
         if rc == 0 and not bad_out:
             return rc, out, err
         last_err = err or out or f"Exit code {rc}"
     return 1, "", last_err or "No supported desktop tool succeeded"
+
+
+def spawn_terminal_with_command(cmd_str):
+    """Open an interactive visible terminal emulator on the host desktop running cmd_str."""
+    env = get_desktop_env()
+    search_path = env["PATH"]
+    runner = 'printf "\\033[1;36m$ %s\\033[0m\\n" "$1"; eval "$1"; echo ""; exec "${SHELL:-/bin/sh}"'
+    candidates = [
+        ("kitty", ["-e", "sh", "-c", runner, "_", cmd_str]),
+        ("konsole", ["-e", "sh", "-c", runner, "_", cmd_str]),
+        ("alacritty", ["-e", "sh", "-c", runner, "_", cmd_str]),
+        ("foot", ["sh", "-c", runner, "_", cmd_str]),
+        ("wezterm", ["start", "--", "sh", "-c", runner, "_", cmd_str]),
+        ("ghostty", ["-e", "sh", "-c", runner, "_", cmd_str]),
+        ("gnome-terminal", ["--", "sh", "-c", runner, "_", cmd_str]),
+        ("xfce4-terminal", ["-x", "sh", "-c", runner, "_", cmd_str]),
+        ("xterm", ["-e", "sh", "-c", runner, "_", cmd_str]),
+    ]
+    for bin_name, args in candidates:
+        resolved = find_bin(bin_name, search_path)
+        if resolved:
+            run_as_user([resolved] + args, background=True, shell=False)
+            record_audit_event("INFO", f"Opened on-screen terminal ({bin_name}) with command")
+            return True, bin_name
+    return False, "No supported desktop terminal emulator found"
+
+
+def type_prompt_to_active_window(text, auto_enter=True):
+    """Inject typed prompt text into the currently focused desktop window (Wayland/X11)."""
+    env = get_desktop_env()
+    search_path = env["PATH"]
+    if find_bin("wtype", search_path):
+        rc, _, err = run_as_user(["wtype", "--", text], timeout=5)
+        if rc == 0:
+            if auto_enter:
+                run_as_user(["wtype", "-k", "Return"], timeout=3)
+            return True, "wtype"
+        last_err = err
+    elif find_bin("ydotool", search_path):
+        rc, _, err = run_as_user(["ydotool", "type", "--", text], timeout=5)
+        if rc == 0:
+            if auto_enter:
+                run_as_user(["ydotool", "key", "28:1", "28:0"], timeout=3)
+            return True, "ydotool"
+        last_err = err
+    elif find_bin("xdotool", search_path):
+        rc, _, err = run_as_user(["xdotool", "type", "--clearmodifiers", "--", text], timeout=5)
+        if rc == 0:
+            if auto_enter:
+                run_as_user(["xdotool", "key", "Return"], timeout=3)
+            return True, "xdotool"
+        last_err = err
+    else:
+        last_err = "Install wtype (Wayland), ydotool, or xdotool (X11) for active-window typing"
+    return False, last_err or "Failed to inject keystrokes into active window"
 
 
 # === SYSTEM TELEMETRY HELPERS ===
@@ -677,25 +1134,33 @@ def get_cpu_percent():
         return 0.0
 
 
+def _collect_hwmon_temps(name_keywords):
+    temps = []
+    hwmon_root = "/sys/class/hwmon"
+    if os.path.isdir(hwmon_root):
+        for hw in os.listdir(hwmon_root):
+            path = os.path.join(hwmon_root, hw)
+            name_file = os.path.join(path, "name")
+            name = ""
+            if os.path.exists(name_file):
+                with open(name_file, "r", encoding="utf-8", errors="ignore") as f:
+                    name = f.read().strip().lower()
+            if any(k in name for k in name_keywords):
+                for fn in os.listdir(path):
+                    if fn.startswith("temp") and fn.endswith("_input"):
+                        with open(os.path.join(path, fn), "r", encoding="utf-8") as f:
+                            val = int(f.read().strip())
+                        if 5000 < val < 130000:
+                            temps.append(val / 1000.0)
+    return temps
+
+
 def get_cpu_temp():
     temps = []
     try:
-        hwmon_root = "/sys/class/hwmon"
-        if os.path.isdir(hwmon_root):
-            for hw in os.listdir(hwmon_root):
-                path = os.path.join(hwmon_root, hw)
-                name_file = os.path.join(path, "name")
-                name = ""
-                if os.path.exists(name_file):
-                    with open(name_file, "r", encoding="utf-8", errors="ignore") as f:
-                        name = f.read().strip().lower()
-                if any(k in name for k in ("k10temp", "coretemp", "zenpower", "cpu", "acpitz", "thinkpad")):
-                    for fn in os.listdir(path):
-                        if fn.startswith("temp") and fn.endswith("_input"):
-                            with open(os.path.join(path, fn), "r", encoding="utf-8") as f:
-                                val = int(f.read().strip())
-                            if 5000 < val < 130000:
-                                temps.append(val / 1000.0)
+        temps = _collect_hwmon_temps(("k10temp", "coretemp", "zenpower", "cpu", "acpitz", "thinkpad"))
+        if not temps:
+            temps = _collect_hwmon_temps(("asus-ec-sensors", "nct67", "it87", "gigabyte", "msi-ec"))
         if not temps and os.path.isdir("/sys/class/thermal"):
             for tz in os.listdir("/sys/class/thermal"):
                 if tz.startswith("thermal_zone"):
@@ -708,6 +1173,143 @@ def get_cpu_temp():
     except Exception:
         pass
     return round(max(temps), 1) if temps else 0.0
+
+
+def get_gpu_info():
+    """Detect desktop/laptop GPU utilization and temperature via nvidia-smi or DRM sysfs."""
+    if find_bin("nvidia-smi"):
+        rc, out, _ = run_cmd([
+            "nvidia-smi",
+            "--query-gpu=name,utilization.gpu,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ], timeout=3)
+        if rc == 0 and out:
+            parts = [p.strip() for p in out.splitlines()[0].split(",")]
+            if len(parts) >= 3:
+                try:
+                    return {
+                        "available": True,
+                        "name": parts[0],
+                        "busy_pct": int(float(parts[1])),
+                        "temp_c": round(float(parts[2]), 1),
+                    }
+                except ValueError:
+                    pass
+
+    drm_root = "/sys/class/drm"
+    if os.path.isdir(drm_root):
+        for card in sorted(os.listdir(drm_root)):
+            if not re.fullmatch(r"card\d+", card):
+                continue
+            dev_dir = os.path.join(drm_root, card, "device")
+            busy_file = os.path.join(dev_dir, "gpu_busy_percent")
+            hwmon_dir = os.path.join(dev_dir, "hwmon")
+            busy_pct = None
+            temp_c = None
+            if os.path.exists(busy_file):
+                try:
+                    with open(busy_file, "r", encoding="utf-8") as f:
+                        busy_pct = int(f.read().strip())
+                except Exception:
+                    pass
+            if os.path.isdir(hwmon_dir):
+                for hm in os.listdir(hwmon_dir):
+                    tf = os.path.join(hwmon_dir, hm, "temp1_input")
+                    if os.path.exists(tf):
+                        try:
+                            with open(tf, "r", encoding="utf-8") as f:
+                                v = int(f.read().strip())
+                            if 5000 < v < 130000:
+                                temp_c = round(v / 1000.0, 1)
+                                break
+                        except Exception:
+                            pass
+            if busy_pct is not None or temp_c is not None:
+                return {
+                    "available": True,
+                    "name": f"GPU ({card})",
+                    "busy_pct": busy_pct,
+                    "temp_c": temp_c,
+                }
+
+    gpu_temps = _collect_hwmon_temps(("amdgpu", "nouveau", "radeon", "xe", "i915"))
+    if gpu_temps:
+        return {"available": True, "name": "GPU", "busy_pct": None, "temp_c": round(max(gpu_temps), 1)}
+    return {"available": False, "name": "Integrated / Unknown", "busy_pct": None, "temp_c": None}
+
+
+def get_swap_info():
+    mem = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith(("SwapTotal:", "SwapFree:")):
+                    k, _, v = line.partition(":")
+                    mem[k.strip()] = int(v.strip().split()[0]) * 1024
+        total = mem.get("SwapTotal", 0)
+        free = mem.get("SwapFree", 0)
+        used = max(0, total - free)
+        pct = round((used / total) * 100.0, 1) if total > 0 else 0.0
+        return {
+            "total_gb": round(total / (1024 ** 3), 1),
+            "used_gb": round(used / (1024 ** 3), 1),
+            "percent": pct,
+        }
+    except Exception:
+        return {"total_gb": 0.0, "used_gb": 0.0, "percent": 0.0}
+
+
+def get_mac_addresses():
+    macs = []
+    net_dir = "/sys/class/net"
+    if os.path.isdir(net_dir):
+        for iface in sorted(os.listdir(net_dir)):
+            if iface == "lo" or iface.startswith(("veth", "docker", "br-", "virbr")):
+                continue
+            addr_path = os.path.join(net_dir, iface, "address")
+            if os.path.exists(addr_path):
+                try:
+                    with open(addr_path, "r", encoding="utf-8") as f:
+                        mac = f.read().strip().lower()
+                    if mac and mac != "00:00:00:00:00:00":
+                        macs.append({"iface": iface, "mac": mac})
+                except OSError:
+                    pass
+    return macs
+
+
+def get_network_telemetry():
+    """Return NIC MACs (WoL) and live total RX/TX throughput (KiB/s) from /proc/net/dev."""
+    global _NET_LAST
+    rx_total = 0
+    tx_total = 0
+    try:
+        with open("/proc/net/dev", "r", encoding="utf-8") as f:
+            for line in f.readlines()[2:]:
+                iface, _, rest = line.partition(":")
+                iface = iface.strip()
+                if not rest or iface == "lo":
+                    continue
+                cols = rest.split()
+                if len(cols) >= 9:
+                    rx_total += int(cols[0])
+                    tx_total += int(cols[8])
+    except Exception:
+        pass
+
+    now = time.monotonic()
+    rx_kbps = 0.0
+    tx_kbps = 0.0
+    if _NET_LAST is not None:
+        dt = max(0.2, now - _NET_LAST[0])
+        rx_kbps = round(max(0, rx_total - _NET_LAST[1]) / 1024.0 / dt, 1)
+        tx_kbps = round(max(0, tx_total - _NET_LAST[2]) / 1024.0 / dt, 1)
+    _NET_LAST = (now, rx_total, tx_total)
+    return {
+        "rx_kbps": rx_kbps,
+        "tx_kbps": tx_kbps,
+        "macs": get_mac_addresses(),
+    }
 
 
 def get_os_info():
@@ -760,10 +1362,11 @@ def get_memory_info():
 
 
 def get_battery_info():
+    ps_dir = "/sys/class/power_supply"
     try:
-        ps_dir = "/sys/class/power_supply"
         if os.path.isdir(ps_dir):
-            for dev in sorted(os.listdir(ps_dir)):
+            entries = sorted(os.listdir(ps_dir))
+            for dev in entries:
                 if dev.startswith("BAT"):
                     base = os.path.join(ps_dir, dev)
                     cap_file = os.path.join(base, "capacity")
@@ -776,27 +1379,81 @@ def get_battery_info():
                             with open(st_file, "r", encoding="utf-8") as f:
                                 status = f.read().strip()
                         plugged = status.lower() in ("charging", "full", "not charging")
-                        return {"percent": cap, "status": status, "plugged": plugged}
+                        return {"has_battery": True, "has_ups": False, "percent": cap, "status": status, "plugged": plugged}
+            for dev in entries:
+                base = os.path.join(ps_dir, dev)
+                tp_file = os.path.join(base, "type")
+                cap_file = os.path.join(base, "capacity")
+                if os.path.exists(tp_file) and os.path.exists(cap_file):
+                    with open(tp_file, "r", encoding="utf-8", errors="ignore") as f:
+                        ptype = f.read().strip().lower()
+                    if ptype == "ups":
+                        with open(cap_file, "r", encoding="utf-8") as f:
+                            cap = int(f.read().strip())
+                        return {"has_battery": False, "has_ups": True, "percent": cap, "status": "UPS Backup", "plugged": True}
     except Exception:
         pass
-    return {"percent": 100, "status": "AC Power", "plugged": True}
+    return {"has_battery": False, "has_ups": False, "percent": None, "status": "AC Desktop", "plugged": True}
+
+
+def _has_internal_backlight():
+    try:
+        return os.path.isdir("/sys/class/backlight") and bool(os.listdir("/sys/class/backlight"))
+    except OSError:
+        return False
+
+
+def _adjust_brightness(mode, value=None):
+    """Adjust internal laptop backlight or external Desktop monitor brightness (DDC/CI or gamma)."""
+    if _has_internal_backlight():
+        if mode == "up":
+            cmds = [["brightnessctl", "set", "+10%"], ["light", "-A", "10"]]
+        elif mode == "down":
+            cmds = [["brightnessctl", "set", "10%-"], ["light", "-U", "10"]]
+        else:
+            cmds = [["brightnessctl", "set", f"{value}%"], ["light", "-S", str(value)]]
+        rc, _, _ = run_first_available(cmds)
+        if rc == 0:
+            return True
+        rc2, _, _ = run_first_system_cmd(cmds)
+        return rc2 == 0
+
+    if find_bin("ddcutil"):
+        if mode == "up":
+            cmd = ["ddcutil", "--noverify", "setvcp", "10", "+", "10"]
+        elif mode == "down":
+            cmd = ["ddcutil", "--noverify", "setvcp", "10", "-", "10"]
+        else:
+            cmd = ["ddcutil", "--noverify", "setvcp", "10", str(value)]
+        rc, _, _ = run_first_system_cmd([cmd], timeout=4)
+        if rc == 0:
+            return True
+
+    if mode == "set" and value is not None:
+        rc, _, _ = run_first_available([
+            ["hyprctl", "hyprsunset", "gamma", str(value)],
+        ], timeout=3)
+        return rc == 0
+    return False
 
 
 def get_media_and_display():
     vol = 50
     muted = False
     brightness = 50
+    brightness_backend = "unavailable"
     media_status = "Stopped"
     media_title = "Nothing playing"
+    search_path = get_desktop_env()["PATH"]
 
-    if shutil.which("wpctl"):
+    if find_bin("wpctl", search_path):
         rc, out, _ = run_as_user(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
         if rc == 0 and out:
             m = re.search(r"Volume:\s*([0-9.]+)", out)
             if m:
                 vol = int(round(float(m.group(1)) * 100))
             muted = "[MUTED]" in out
-    elif shutil.which("pactl"):
+    elif find_bin("pactl", search_path):
         rc, out, _ = run_as_user(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
         if rc == 0 and out:
             m = re.search(r"(\d+)%", out)
@@ -806,14 +1463,17 @@ def get_media_and_display():
         if rc_m == 0:
             muted = "yes" in out_m.lower()
 
-    if shutil.which("brightnessctl"):
+    if _has_internal_backlight() and find_bin("brightnessctl", search_path):
         rc_b, out_b, _ = run_cmd(["brightnessctl", "-m"])
         if rc_b == 0 and out_b:
             m = re.search(r",(\d+)%,", out_b)
             if m:
                 brightness = int(m.group(1))
+                brightness_backend = "backlight"
+    elif find_bin("ddcutil", search_path):
+        brightness_backend = "ddcutil"
 
-    if shutil.which("playerctl"):
+    if find_bin("playerctl", search_path):
         rc_s, out_s, _ = run_as_user(["playerctl", "status"])
         if rc_s == 0 and out_s:
             media_status = out_s
@@ -827,77 +1487,193 @@ def get_media_and_display():
         "volume": vol,
         "muted": muted,
         "brightness": brightness,
+        "brightness_backend": brightness_backend,
         "media_status": media_status,
         "media_title": media_title,
     }
 
 
+def _get_hyprland_workspaces():
+    rc_ws, out_ws, _ = run_as_user(["hyprctl", "workspaces", "-j"], timeout=3)
+    if rc_ws != 0 or not out_ws:
+        return None
+    try:
+        raw_ws = json.loads(out_ws)
+        active_id = None
+        rc_aw, out_aw, _ = run_as_user(["hyprctl", "activeworkspace", "-j"], timeout=3)
+        if rc_aw == 0 and out_aw:
+            aw = json.loads(out_aw)
+            if isinstance(aw, dict) and isinstance(aw.get("id"), int):
+                active_id = aw["id"]
+
+        by_id = {}
+        if isinstance(raw_ws, list):
+            for w in raw_ws:
+                if not isinstance(w, dict):
+                    continue
+                wid = w.get("id")
+                wtype = str(w.get("type") or "").lower()
+                if not isinstance(wid, int) or wid <= 0 or wtype == "special":
+                    continue
+                by_id[wid] = {
+                    "id": wid,
+                    "name": str(w.get("name") or wid),
+                    "active": wid == active_id,
+                    "windows": int(w.get("windows") or 0),
+                }
+        if isinstance(active_id, int) and active_id > 0 and active_id not in by_id:
+            by_id[active_id] = {
+                "id": active_id,
+                "name": str(active_id),
+                "active": True,
+                "windows": 0,
+            }
+        if by_id:
+            return [by_id[k] for k in sorted(by_id)]
+    except Exception:
+        pass
+    return None
+
+
+def _get_niri_workspaces():
+    rc_nr, out_nr, _ = run_as_user(["niri", "msg", "--json", "workspaces"], timeout=3)
+    if rc_nr != 0 or not out_nr:
+        return None
+    try:
+        raw_nr = json.loads(out_nr)
+        if not isinstance(raw_nr, list):
+            return None
+        focused_output = next(
+            (w.get("output") for w in raw_nr if isinstance(w, dict) and w.get("is_focused")),
+            None,
+        )
+        by_idx = {}
+        for w in raw_nr:
+            if not isinstance(w, dict):
+                continue
+            if focused_output is not None and w.get("output") != focused_output:
+                continue
+            idx = w.get("idx")
+            if not isinstance(idx, int) or idx <= 0:
+                continue
+            by_idx[idx] = {
+                "id": idx,
+                "name": str(w.get("name") or idx),
+                "active": bool(w.get("is_focused") or w.get("is_active")),
+                "windows": 1 if w.get("active_window_id") is not None else 0,
+            }
+        if by_idx:
+            return [by_idx[k] for k in sorted(by_idx)]
+    except Exception:
+        pass
+    return None
+
+
+def _get_sway_workspaces():
+    rc_sw, out_sw, _ = run_as_user(["swaymsg", "-t", "get_workspaces", "-r"], timeout=3)
+    if rc_sw != 0 or not out_sw:
+        return None
+    try:
+        raw_sw = json.loads(out_sw)
+        items = []
+        if isinstance(raw_sw, list):
+            for w in raw_sw:
+                if not isinstance(w, dict):
+                    continue
+                num = w.get("num")
+                if not isinstance(num, int) or num <= 0:
+                    continue
+                items.append({
+                    "id": num,
+                    "name": str(w.get("name") or num),
+                    "active": bool(w.get("focused")),
+                    "windows": 0,
+                })
+        if items:
+            return sorted(items, key=lambda item: item["id"])
+    except Exception:
+        pass
+    return None
+
+
+def _get_kde_workspaces(search_path):
+    for qbin in ("qdbus6", "qdbus"):
+        if not find_bin(qbin, search_path):
+            continue
+        rc_cnt, out_cnt, _ = run_as_user(
+            [qbin, "org.kde.KWin", "/VirtualDesktopManager", "org.kde.KWin.VirtualDesktopManager.count"],
+            timeout=3,
+        )
+        rc_cur, out_cur, _ = run_as_user(
+            [qbin, "org.kde.KWin", "/KWin", "org.kde.KWin.currentDesktop"],
+            timeout=3,
+        )
+        if rc_cnt == 0 and out_cnt.strip().isdigit():
+            count = max(1, min(20, int(out_cnt.strip())))
+            cur = int(out_cur.strip()) if rc_cur == 0 and out_cur.strip().isdigit() else 1
+            return [{"id": i, "name": str(i), "active": i == cur, "windows": 0} for i in range(1, count + 1)]
+    if find_bin("kdotool", search_path):
+        rc_n, out_n, _ = run_as_user(["kdotool", "get_num_desktops"], timeout=3)
+        rc_c, out_c, _ = run_as_user(["kdotool", "get_desktop"], timeout=3)
+        if rc_n == 0 and out_n.strip().isdigit():
+            count = max(1, min(20, int(out_n.strip())))
+            cur = int(out_c.strip()) if rc_c == 0 and out_c.strip().isdigit() else 1
+            return [{"id": i, "name": str(i), "active": i == cur, "windows": 0} for i in range(1, count + 1)]
+    if find_bin("dbus-send", search_path):
+        rc_cnt, out_cnt, _ = run_as_user(
+            [
+                "dbus-send", "--session", "--print-reply=literal", "--dest=org.kde.KWin",
+                "/VirtualDesktopManager", "org.kde.KWin.VirtualDesktopManager.count",
+            ],
+            timeout=3,
+        )
+        rc_cur, out_cur, _ = run_as_user(
+            [
+                "dbus-send", "--session", "--print-reply=literal", "--dest=org.kde.KWin",
+                "/KWin", "org.kde.KWin.currentDesktop",
+            ],
+            timeout=3,
+        )
+        m_cnt = re.search(r"\b(\d+)\b", out_cnt or "") if rc_cnt == 0 else None
+        if m_cnt:
+            count = max(1, min(20, int(m_cnt.group(1))))
+            m_cur = re.search(r"\b(\d+)\b", out_cur or "") if rc_cur == 0 else None
+            cur = int(m_cur.group(1)) if m_cur else 1
+            return [{"id": i, "name": str(i), "active": i == cur, "windows": 0} for i in range(1, count + 1)]
+    return None
+
+
 def get_workspaces_info():
-    """Return active desktop workspaces sorted numerically for Hyprland, Sway, or X11."""
-    if shutil.which("hyprctl"):
-        rc_ws, out_ws, _ = run_as_user(["hyprctl", "workspaces", "-j"], timeout=3)
-        if rc_ws == 0 and out_ws:
-            try:
-                raw_ws = json.loads(out_ws)
-                active_id = None
-                rc_aw, out_aw, _ = run_as_user(["hyprctl", "activeworkspace", "-j"], timeout=3)
-                if rc_aw == 0 and out_aw:
-                    aw = json.loads(out_aw)
-                    if isinstance(aw, dict) and isinstance(aw.get("id"), int):
-                        active_id = aw["id"]
+    """Return active desktop workspaces sorted numerically across Wayland and X11 environments."""
+    env = get_desktop_env()
+    search_path = env["PATH"]
+    comp = get_active_compositor(env)
 
-                by_id = {}
-                if isinstance(raw_ws, list):
-                    for w in raw_ws:
-                        if not isinstance(w, dict):
-                            continue
-                        wid = w.get("id")
-                        wtype = str(w.get("type") or "").lower()
-                        if not isinstance(wid, int) or wid <= 0 or wtype == "special":
-                            continue
-                        by_id[wid] = {
-                            "id": wid,
-                            "name": str(w.get("name") or wid),
-                            "active": wid == active_id,
-                            "windows": int(w.get("windows") or 0),
-                        }
-                if isinstance(active_id, int) and active_id > 0 and active_id not in by_id:
-                    by_id[active_id] = {
-                        "id": active_id,
-                        "name": str(active_id),
-                        "active": True,
-                        "windows": 0,
-                    }
-                if by_id:
-                    return [by_id[k] for k in sorted(by_id)]
-            except Exception:
-                pass
+    if comp in ("hyprland", "") and find_bin("hyprctl", search_path):
+        res = _get_hyprland_workspaces()
+        if res:
+            return res
 
-    if shutil.which("swaymsg"):
-        rc_sw, out_sw, _ = run_as_user(["swaymsg", "-t", "get_workspaces", "-r"], timeout=3)
-        if rc_sw == 0 and out_sw:
-            try:
-                raw_sw = json.loads(out_sw)
-                items = []
-                if isinstance(raw_sw, list):
-                    for w in raw_sw:
-                        if not isinstance(w, dict):
-                            continue
-                        num = w.get("num")
-                        if not isinstance(num, int) or num <= 0:
-                            continue
-                        items.append({
-                            "id": num,
-                            "name": str(w.get("name") or num),
-                            "active": bool(w.get("focused")),
-                            "windows": 0,
-                        })
-                if items:
-                    return sorted(items, key=lambda item: item["id"])
-            except Exception:
-                pass
+    if comp in ("niri", "") and find_bin("niri", search_path):
+        res = _get_niri_workspaces()
+        if res:
+            return res
 
-    if shutil.which("wmctrl"):
+    if comp in ("sway", "") and find_bin("swaymsg", search_path):
+        res = _get_sway_workspaces()
+        if res:
+            return res
+
+    if comp in ("kde", ""):
+        res = _get_kde_workspaces(search_path)
+        if res:
+            return res
+
+    if comp == "river":
+        cur_tag = _LAST_RIVER_TAG if 1 <= _LAST_RIVER_TAG <= 9 else 1
+        return [{"id": i, "name": str(i), "active": i == cur_tag, "windows": 0} for i in range(1, 10)]
+
+    if find_bin("wmctrl", search_path):
         rc_wm, out_wm, _ = run_as_user(["wmctrl", "-d"], timeout=3)
         if rc_wm == 0 and out_wm:
             items = []
@@ -911,7 +1687,7 @@ def get_workspaces_info():
             if items:
                 return items
 
-    if shutil.which("xdotool"):
+    if find_bin("xdotool", search_path):
         rc_n, out_n, _ = run_as_user(["xdotool", "get_num_desktops"], timeout=3)
         rc_c, out_c, _ = run_as_user(["xdotool", "get_desktop"], timeout=3)
         if rc_n == 0 and out_n.strip().isdigit():
@@ -922,7 +1698,9 @@ def get_workspaces_info():
     return [{"id": i, "name": str(i), "active": i == 1, "windows": 0} for i in range(1, 5)]
 
 
-def _collect_disk_nodes(nodes, out_list):
+def _collect_disk_nodes(nodes, out_list, seen=None):
+    if seen is None:
+        seen = set()
     for node in nodes:
         if not isinstance(node, dict):
             continue
@@ -934,25 +1712,28 @@ def _collect_disk_nodes(nodes, out_list):
         is_virtual = name.startswith(("zram", "loop")) or ntype in ("zram", "loop", "rom")
         if not is_virtual and fstype and fstype.lower() != "swap":
             mount = node.get("mountpoint")
-            label = node.get("label") or node.get("partlabel") or mount or name
-            size = str(node.get("size") or "-")
-            use_pct = str(node.get("fsuse%") or "-")
-            out_list.append({
-                "part": name,
-                "label": str(label),
-                "fstype": fstype,
-                "size": size,
-                "use_pct": use_pct,
-                "mounted": bool(mount),
-            })
+            key = (name, fstype, str(mount or ""))
+            if key not in seen:
+                seen.add(key)
+                label = node.get("label") or node.get("partlabel") or mount or name
+                size = str(node.get("size") or "-")
+                use_pct = str(node.get("fsuse%") or "-")
+                out_list.append({
+                    "part": name,
+                    "label": str(label),
+                    "fstype": fstype,
+                    "size": size,
+                    "use_pct": use_pct,
+                    "mounted": bool(mount),
+                })
 
         if children:
-            _collect_disk_nodes(children, out_list)
+            _collect_disk_nodes(children, out_list, seen)
 
 
 def get_disks_info():
     disks = []
-    if shutil.which("lsblk"):
+    if find_bin("lsblk"):
         rc, out, _ = run_cmd([
             "lsblk",
             "-J",
@@ -970,7 +1751,7 @@ def get_disks_info():
 
 def get_boot_entries():
     entries = []
-    if shutil.which("efibootmgr"):
+    if find_bin("efibootmgr"):
         rc, out, _ = run_cmd(["efibootmgr"])
         if rc == 0 and out:
             for line in out.splitlines():
@@ -986,9 +1767,772 @@ def get_boot_entries():
     return entries
 
 
+def detect_init_system():
+    """Detect the host Linux init system / service manager."""
+    if os.path.isdir("/run/systemd/system"):
+        return "systemd"
+    if os.path.isdir("/run/openrc") or os.path.exists("/sbin/openrc-run"):
+        return "openrc"
+    if os.path.isdir("/run/runit") or os.path.isdir("/etc/runit"):
+        return "runit"
+    try:
+        with open("/proc/1/comm", "r", encoding="utf-8", errors="ignore") as f:
+            comm = f.read().strip().lower()
+        if "systemd" in comm:
+            return "systemd"
+        if "openrc" in comm:
+            return "openrc"
+        if "runit" in comm:
+            return "runit"
+        if "s6" in comm:
+            return "s6"
+    except OSError:
+        pass
+    if find_bin("systemctl"):
+        return "systemd"
+    if find_bin("rc-service"):
+        return "openrc"
+    if find_bin("sv"):
+        return "runit"
+    return "unknown"
+
+
+def _read_tail_lines(path, max_lines=150, max_bytes=524288):
+    """Read at most the trailing max_bytes from a log file cleanly."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - max_bytes)
+            f.seek(start)
+            raw = f.read().decode("utf-8", errors="replace")
+        lines = raw.splitlines()
+        if start > 0 and lines:
+            lines = lines[1:]
+        return [ln for ln in lines if ln.strip()][-max_lines:]
+    except OSError:
+        return []
+
+
+def _classify_log_level(text, default="INFO"):
+    low = text.lower()
+    if any(k in low for k in ("critical", "crit", "fatal", "panic", "segfault", "oom-killer", "error", "[err]", " fail", "failed")):
+        return "ERROR"
+    if any(k in low for k in ("warn", "warning", "deprecated", "timeout", "retry")):
+        return "WARN"
+    return default
+
+
+def _level_matches_filter(entry_level, wanted):
+    w = (wanted or "all").lower()
+    lvl = (entry_level or "INFO").upper()
+    if w == "err":
+        return lvl in ("ERROR", "CRIT", "FATAL")
+    if w == "warn":
+        return lvl in ("ERROR", "CRIT", "FATAL", "WARN")
+    return True
+
+
+def _parse_log_line(raw_line, source_name):
+    ts = ""
+    msg = raw_line.strip()
+    m_iso = re.match(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\S*)?)\s+(.*)$", msg)
+    if m_iso:
+        ts = m_iso.group(1)
+        msg = m_iso.group(2)
+    else:
+        m_dmesg = re.match(r"^\[([^\]]+)\]\s*(.*)$", msg)
+        if m_dmesg:
+            ts = m_dmesg.group(1).strip()
+            msg = m_dmesg.group(2)
+        else:
+            m_sys = re.match(r"^([A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+(.*)$", msg)
+            if m_sys:
+                ts = m_sys.group(1)
+                msg = m_sys.group(2)
+    return {
+        "ts": ts,
+        "source": source_name,
+        "level": _classify_log_level(raw_line),
+        "message": msg[:1200],
+    }
+
+
+def get_system_logs(source="all", level="all", query="", lines=120):
+    """Aggregate bounded logs across systemd journal, syslog/OpenRC/socklog, dmesg, and mobile-rc."""
+    src = (source or "all").strip().lower()
+    lvl = (level or "all").strip().lower()
+    q_low = str(query or "").strip().lower()[:120]
+    try:
+        limit = max(20, min(400, int(lines)))
+    except (TypeError, ValueError):
+        limit = 120
+
+    has_journal = bool(find_bin("journalctl"))
+    has_dmesg = bool(find_bin("dmesg"))
+    syslog_files = [
+        p for p in (
+            "/var/log/messages",
+            "/var/log/syslog",
+            "/var/log/socklog/everything/current",
+            "/var/log/everything/current",
+        )
+        if os.path.isfile(p)
+    ]
+    openrc_files = [p for p in ("/var/log/rc.log",) if os.path.isfile(p)]
+
+    available_sources = ["mobile-rc"]
+    if has_journal:
+        available_sources.append("journal")
+    if openrc_files:
+        available_sources.append("openrc")
+    if syslog_files:
+        available_sources.append("syslog")
+    if has_dmesg:
+        available_sources.append("dmesg")
+
+    entries = []
+    per_src = limit if src != "all" else max(30, min(80, limit))
+
+    if src in ("all", "mobile-rc"):
+        for item in list(_AUDIT_LOG)[-per_src:]:
+            entries.append(dict(item))
+        if os.path.isfile("/var/log/mobile-rc.log"):
+            for raw in _read_tail_lines("/var/log/mobile-rc.log", max_lines=per_src):
+                entries.append(_parse_log_line(raw, "mobile-rc"))
+
+    if src in ("all", "journal") and has_journal:
+        jcmd = ["journalctl", "-n", str(per_src), "--no-pager", "-o", "short-iso"]
+        if lvl == "err":
+            jcmd.extend(["-p", "3"])
+        elif lvl == "warn":
+            jcmd.extend(["-p", "4"])
+        rc, out, _ = run_cmd(jcmd, timeout=6)
+        if rc == 0 and out:
+            for raw in out.splitlines():
+                if not raw.startswith("-- "):
+                    entries.append(_parse_log_line(raw, "journal"))
+
+    if src in ("all", "openrc") and openrc_files:
+        for path in openrc_files:
+            for raw in _read_tail_lines(path, max_lines=per_src):
+                entries.append(_parse_log_line(raw, "openrc"))
+
+    if src in ("all", "syslog") and syslog_files:
+        for path in syslog_files[:2]:
+            for raw in _read_tail_lines(path, max_lines=per_src):
+                entries.append(_parse_log_line(raw, "syslog"))
+
+    if src in ("all", "dmesg") and has_dmesg:
+        dcmd = ["dmesg", "-T"]
+        if lvl == "err":
+            dcmd.append("--level=emerg,alert,crit,err")
+        elif lvl == "warn":
+            dcmd.append("--level=emerg,alert,crit,err,warn")
+        rc, out, _ = run_cmd(dcmd, timeout=5)
+        if rc != 0:
+            rc, out, _ = run_cmd(["dmesg"], timeout=5)
+        if rc == 0 and out:
+            for raw in out.splitlines()[-per_src:]:
+                if raw.strip():
+                    entries.append(_parse_log_line(raw, "dmesg"))
+
+    filtered = []
+    for item in entries:
+        if not _level_matches_filter(item.get("level"), lvl):
+            continue
+        if q_low:
+            hay = f"{item.get('ts', '')} {item.get('source', '')} {item.get('level', '')} {item.get('message', '')}".lower()
+            if q_low not in hay:
+                continue
+        filtered.append(item)
+
+    if len(filtered) > limit:
+        filtered = filtered[-limit:]
+
+    return {
+        "init_system": detect_init_system(),
+        "available_sources": available_sources,
+        "entries": filtered,
+        "total": len(filtered),
+    }
+
+
+def _parse_os_release_file(path):
+    """Parse /etc/os-release style key=value metadata into a dict."""
+    if not os.path.isfile(path):
+        return None
+    data = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                data[k.strip()] = v.strip().strip("\"'")
+        if data:
+            return {
+                "name": data.get("PRETTY_NAME") or data.get("NAME") or "Linux",
+                "id": data.get("ID") or "linux",
+                "version_id": data.get("VERSION_ID") or "",
+            }
+    except OSError:
+        pass
+    return None
+
+
+def _scan_bootloader_configs():
+    """Collect bootloader entries from systemd-boot and GRUB configs read-only."""
+    entries = []
+    for base in ("/boot/loader/entries", "/efi/loader/entries", "/boot/efi/loader/entries"):
+        if not os.path.isdir(base):
+            continue
+        try:
+            for fname in sorted(os.listdir(base)):
+                if not fname.endswith(".conf"):
+                    continue
+                fpath = os.path.join(base, fname)
+                title = fname[:-5]
+                linux_img = ""
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            s = line.strip()
+                            if s.startswith("title "):
+                                title = s[6:].strip()
+                            elif s.startswith("linux "):
+                                linux_img = s[6:].strip()
+                except OSError:
+                    continue
+                entries.append({"loader": "systemd-boot", "title": title, "kernel": linux_img, "file": fname})
+        except OSError:
+            pass
+
+    for gpath in ("/boot/grub/grub.cfg", "/boot/grub2/grub.cfg", "/boot/efi/EFI/grub/grub.cfg"):
+        if not os.path.isfile(gpath):
+            continue
+        try:
+            with open(gpath, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read(524288)
+            for m in re.finditer(r"^\s*menuentry\s+(['\"])(.+?)\1", content, flags=re.MULTILINE):
+                title = m.group(2).strip()
+                if title:
+                    entries.append({"loader": "grub", "title": title, "kernel": "", "file": gpath})
+        except OSError:
+            pass
+    return entries[:40]
+
+
+def _scan_mounted_filesystems():
+    """List mounted Linux filesystems cleanly via findmnt or /proc/mounts."""
+    mounts = []
+    if find_bin("findmnt"):
+        rc, out, _ = run_cmd(["findmnt", "-J", "-l", "-o", "SOURCE,TARGET,FSTYPE,OPTIONS"], timeout=5)
+        if rc == 0 and out:
+            try:
+                parsed = json.loads(out)
+                for node in parsed.get("filesystems", []):
+                    fstype = str(node.get("fstype") or "")
+                    target = str(node.get("target") or "")
+                    source = str(node.get("source") or "")
+                    opts = str(node.get("options") or "")
+                    if fstype in ("proc", "sysfs", "tmpfs", "devtmpfs", "devpts", "cgroup", "cgroup2", "pstore", "bpf", "tracefs", "securityfs", "efivarfs", "fusectl", "debugfs", "ramfs", "configfs", "hugetlbfs", "mqueue", "autofs"):
+                        continue
+                    mounts.append({"source": source, "target": target, "fstype": fstype, "options": opts})
+                return mounts[:30]
+            except Exception:
+                pass
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                source, target, fstype, opts = parts[0], parts[1], parts[2], parts[3]
+                if not source.startswith("/dev/"):
+                    continue
+                mounts.append({"source": source, "target": target, "fstype": fstype, "options": opts})
+    except OSError:
+        pass
+    return mounts[:30]
+
+
+def _inspect_mounted_tree_for_distros(root_path, dev_path, fstype, label, uuid):
+    """Look for /etc/os-release at root or in Btrfs top-level subvolumes under root_path."""
+    found = []
+    seen_roots = set()
+    candidates = [("", root_path)]
+    if fstype == "btrfs":
+        try:
+            for name in sorted(os.listdir(root_path)):
+                if name.startswith("@"):
+                    sub_path = os.path.join(root_path, name)
+                    if os.path.isdir(sub_path):
+                        candidates.append((name, sub_path))
+        except OSError:
+            pass
+    for subvol, base in candidates:
+        for rel in ("etc/os-release", "usr/lib/os-release"):
+            info = _parse_os_release_file(os.path.join(base, rel))
+            if info:
+                key = (dev_path, subvol, info["name"])
+                if key not in seen_roots:
+                    seen_roots.add(key)
+                    found.append({
+                        "name": info["name"],
+                        "id": info["id"],
+                        "version_id": info["version_id"],
+                        "device": dev_path,
+                        "fstype": fstype,
+                        "label": label,
+                        "uuid": uuid,
+                        "subvolume": subvol or "/",
+                    })
+                break
+    return found
+
+
+def _walk_lsblk_devices(nodes, out):
+    for node in nodes or []:
+        out.append(node)
+        if node.get("children"):
+            _walk_lsblk_devices(node["children"], out)
+
+
+def get_installed_distros_info(deep=False, refresh=False):
+    """Inventory running OS, bootloaders, os-prober, and optionally read-only unmounted partitions."""
+    global _DISTRO_CACHE
+    cache_key = "deep" if deep else "safe"
+    now = time.time()
+    cached = _DISTRO_CACHE.get(cache_key)
+    ttl = 300 if deep else 45
+    if not refresh and cached and (now - cached.get("_ts", 0)) < ttl:
+        res = dict(cached)
+        res.pop("_ts", None)
+        res["cached"] = True
+        return res
+
+    os_info = get_os_info()
+    cpu_model = ""
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    cpu_model = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+
+    env = get_desktop_env()
+    host = {
+        "name": os_info.get("name", "Linux"),
+        "hostname": os_info.get("hostname", ""),
+        "kernel": os_info.get("kernel", ""),
+        "arch": platform.machine(),
+        "init_system": detect_init_system(),
+        "compositor": get_active_compositor(env) or "unknown",
+        "cpu_model": cpu_model or platform.processor() or "Unknown CPU",
+        "gpu_name": get_gpu_info().get("name", "Integrated / Unknown"),
+    }
+
+    efi_entries = get_boot_entries()
+    bootloader_entries = _scan_bootloader_configs()
+    filesystems = _scan_mounted_filesystems()
+
+    os_prober = []
+    if find_bin("os-prober"):
+        rc, out, _ = run_cmd(["os-prober"], timeout=10)
+        if rc == 0 and out:
+            for line in out.splitlines():
+                parts = line.split(":")
+                if len(parts) >= 3:
+                    os_prober.append({
+                        "device": parts[0].strip(),
+                        "name": parts[1].strip(),
+                        "short": parts[2].strip(),
+                        "boot_type": parts[3].strip() if len(parts) > 3 else "",
+                    })
+
+    unmounted_distros = []
+    scan_errors = []
+    if deep:
+        linux_fs = {"ext4", "ext3", "ext2", "btrfs", "xfs", "f2fs", "jfs", "reiserfs", "nilfs2"}
+        with _DISTRO_SCAN_LOCK:
+            if find_bin("lsblk"):
+                rc, out, err = run_cmd(
+                    ["lsblk", "-J", "-o", "NAME,PATH,TYPE,FSTYPE,LABEL,PARTLABEL,UUID,SIZE,MOUNTPOINT"],
+                    timeout=8,
+                )
+                if rc == 0 and out:
+                    try:
+                        tree = json.loads(out)
+                        flat = []
+                        _walk_lsblk_devices(tree.get("blockdevices", []), flat)
+                        for dev in flat:
+                            name = str(dev.get("name") or "")
+                            if name.startswith(("zram", "loop", "ram")):
+                                continue
+                            fstype = str(dev.get("fstype") or "").lower()
+                            mnt = dev.get("mountpoint")
+                            dev_path = str(dev.get("path") or (f"/dev/{name}" if name else ""))
+                            if not dev_path or mnt or fstype not in linux_fs:
+                                continue
+                            label = str(dev.get("label") or dev.get("partlabel") or "")
+                            uuid = str(dev.get("uuid") or "")
+                            with tempfile.TemporaryDirectory(prefix="mrc-probe-") as tmpdir:
+                                mounted = False
+                                try:
+                                    opts_candidates = ["ro,noload", "ro"] if fstype in ("ext4", "ext3", "xfs") else ["ro"]
+                                    for mopts in opts_candidates:
+                                        mrc, _, merr = run_cmd(["mount", "-o", mopts, dev_path, tmpdir], timeout=6)
+                                        if mrc == 0:
+                                            mounted = True
+                                            break
+                                    if mounted:
+                                        found = _inspect_mounted_tree_for_distros(tmpdir, dev_path, fstype, label, uuid)
+                                        unmounted_distros.extend(found)
+                                except Exception as ex:
+                                    scan_errors.append(f"{dev_path}: {ex}")
+                                finally:
+                                    if mounted:
+                                        urc, _, uerr = run_cmd(["umount", tmpdir], timeout=6)
+                                        if urc != 0:
+                                            scan_errors.append(f"umount {dev_path}: {uerr or urc}")
+                    except Exception as ex:
+                        scan_errors.append(f"lsblk parse: {ex}")
+                elif err:
+                    scan_errors.append(err)
+            else:
+                scan_errors.append("lsblk utility not found")
+
+    detected_distros = [{"name": host["name"], "source": "Running Host", "detail": f"{host['init_system']} / {host['kernel']}"}]
+    seen_names = {host["name"].lower()}
+    for item in unmounted_distros:
+        lbl = f"{item['device']} ({item['fstype']}, subvol {item['subvolume']})"
+        detected_distros.append({"name": item["name"], "source": "Unmounted Partition", "detail": lbl})
+        seen_names.add(item["name"].lower())
+    for item in os_prober:
+        if item["name"].lower() not in seen_names:
+            detected_distros.append({"name": item["name"], "source": "os-prober", "detail": item["device"]})
+            seen_names.add(item["name"].lower())
+    for item in bootloader_entries:
+        t = item["title"]
+        if t.lower() not in seen_names:
+            detected_distros.append({"name": t, "source": item["loader"], "detail": item.get("kernel") or item.get("file", "")})
+            seen_names.add(t.lower())
+
+    payload = {
+        "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "deep_scan": bool(deep),
+        "cached": False,
+        "host": host,
+        "efi_entries": efi_entries,
+        "bootloader_entries": bootloader_entries,
+        "os_prober": os_prober,
+        "filesystems": filesystems,
+        "unmounted_distros": unmounted_distros,
+        "detected_distros": detected_distros,
+        "scan_errors": scan_errors,
+    }
+    cache_copy = dict(payload)
+    cache_copy["_ts"] = now
+    _DISTRO_CACHE[cache_key] = cache_copy
+    return payload
+
+
+def get_services_info():
+    """Return host service list normalized across OpenRC, systemd, and runit."""
+    init_sys = detect_init_system()
+    services = []
+    if init_sys == "openrc" and find_bin("rc-status"):
+        rc, out, _ = run_cmd(["rc-status", "-a", "-C"], timeout=6)
+        runlevel = "default"
+        if rc == 0 and out:
+            for line in out.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith("Runlevel:"):
+                    runlevel = s.split(":", 1)[1].strip()
+                    continue
+                m = re.match(r"^([A-Za-z0-9_.@:-]+)\s+\[\s*([^\]]+?)\s*\]$", s)
+                if m:
+                    services.append({
+                        "name": m.group(1),
+                        "status": m.group(2).strip(),
+                        "runlevel": runlevel,
+                    })
+    elif init_sys == "systemd" and find_bin("systemctl"):
+        rc, out, _ = run_cmd(
+            ["systemctl", "list-units", "--type=service", "--all", "--no-pager", "--no-legend"],
+            timeout=6,
+        )
+        if rc == 0 and out:
+            for line in out.splitlines()[:80]:
+                parts = line.split(None, 4)
+                if len(parts) >= 4:
+                    unit = parts[0].removesuffix(".service")
+                    services.append({
+                        "name": unit,
+                        "status": f"{parts[2]} ({parts[3]})",
+                        "runlevel": "systemd",
+                    })
+    elif init_sys == "runit" and find_bin("sv"):
+        for base in ("/run/runit/service", "/var/service"):
+            if not os.path.isdir(base):
+                continue
+            for name in sorted(os.listdir(base))[:60]:
+                rc, out, _ = run_cmd(["sv", "status", os.path.join(base, name)], timeout=3)
+                st = out.split(":", 1)[0].strip() if out else ("ok" if rc == 0 else "down")
+                services.append({"name": name, "status": st, "runlevel": "runit"})
+            break
+    return {"init_system": init_sys, "services": services}
+
+
+def control_service(name, action):
+    """Safely start, stop, restart, or reload a system service under validated init tools."""
+    svc = str(name or "").strip()
+    act = str(action or "").strip().lower()
+    if not re.fullmatch(r"[A-Za-z0-9_.@:-]{1,96}", svc):
+        return False, "Invalid service name"
+    if act not in ("start", "stop", "restart", "reload"):
+        return False, "Invalid service action"
+    init_sys = detect_init_system()
+    if init_sys == "openrc" and find_bin("rc-service"):
+        rc, out, err = run_cmd(["rc-service", svc, act], timeout=20)
+    elif init_sys == "systemd" and find_bin("systemctl"):
+        rc, out, err = run_cmd(["systemctl", act, svc], timeout=20)
+    elif init_sys == "runit" and find_bin("sv"):
+        sv_act = "hup" if act == "reload" else act
+        rc, out, err = run_cmd(["sv", sv_act, svc], timeout=15)
+    else:
+        return False, f"Service control not supported on init system '{init_sys}'"
+    msg = (out or err or f"{svc} {act}: exit {rc}").strip()
+    if rc == 0:
+        record_audit_event("INFO", f"Service action: {svc} -> {act}")
+    else:
+        record_audit_event("WARN", f"Service action failed: {svc} -> {act} ({msg})")
+    return rc == 0, msg
+
+
+def get_processes_info(limit=30):
+    """Return top running processes sorted by CPU/RSS delta using /proc without external deps."""
+    global _PROC_LAST
+    try:
+        cap = max(5, min(60, int(limit)))
+    except (TypeError, ValueError):
+        cap = 30
+
+    total_ticks = 0
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            total_ticks = sum(int(x) for x in f.readline().split()[1:8])
+    except Exception:
+        total_ticks = 0
+
+    prev_total, prev_procs = _PROC_LAST if _PROC_LAST else (0, {})
+    dt_ticks = max(1, total_ticks - prev_total) if prev_total and total_ticks > prev_total else 0
+    cur_procs = {}
+    items = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        pids = []
+
+    for pid_str in pids:
+        try:
+            pid = int(pid_str)
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="ignore") as f:
+                stat_raw = f.read()
+            rparen = stat_raw.rfind(")")
+            if rparen <= 0:
+                continue
+            lparen = stat_raw.find("(")
+            comm = stat_raw[lparen + 1:rparen]
+            rest = stat_raw[rparen + 2:].split()
+            if len(rest) < 22:
+                continue
+            state = rest[0]
+            proc_ticks = int(rest[11]) + int(rest[12])
+            rss_pages = int(rest[21])
+            rss_mb = round((rss_pages * 4096) / (1024 * 1024), 1)
+            cur_procs[pid] = proc_ticks
+            cpu_pct = 0.0
+            if dt_ticks > 0 and pid in prev_procs:
+                cpu_pct = round(max(0.0, (proc_ticks - prev_procs[pid]) / dt_ticks * 100.0 * (os.cpu_count() or 1)), 1)
+            cmd = comm
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as cf:
+                    raw_cmd = cf.read(256).replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+                if raw_cmd:
+                    cmd = raw_cmd[:96]
+            except OSError:
+                pass
+            items.append({
+                "pid": pid,
+                "name": comm[:32],
+                "cmd": cmd,
+                "state": state,
+                "cpu_pct": cpu_pct,
+                "rss_mb": rss_mb,
+            })
+        except Exception:
+            continue
+
+    _PROC_LAST = (total_ticks, cur_procs)
+    items.sort(key=lambda p: (p["cpu_pct"], p["rss_mb"]), reverse=True)
+    return {"processes": items[:cap], "total": len(items)}
+
+
+def kill_process(pid, sig_name="TERM"):
+    """Send TERM, KILL, or HUP to a non-init non-self PID cleanly."""
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False, "Invalid PID"
+    if pid_int <= 1 or pid_int == os.getpid():
+        return False, "Refusing to signal init or Mobile-RC server process"
+    sig_map = {"TERM": 15, "KILL": 9, "HUP": 1}
+    sig_key = str(sig_name or "TERM").strip().upper()
+    if sig_key not in sig_map:
+        return False, "Unsupported signal (use TERM, KILL, or HUP)"
+    try:
+        os.kill(pid_int, sig_map[sig_key])
+        record_audit_event("WARN", f"Sent SIG{sig_key} to PID {pid_int}")
+        return True, f"Sent SIG{sig_key} to PID {pid_int}"
+    except ProcessLookupError:
+        return False, f"Process {pid_int} not found"
+    except PermissionError:
+        return False, f"Permission denied signaling PID {pid_int}"
+    except Exception as e:
+        return False, str(e)
+
+
+_ALLOWED_REMOTE_KEYS = {
+    "Return", "BackSpace", "Escape", "Tab", "space",
+    "Left", "Right", "Up", "Down", "Prior", "Next", "Home", "End",
+    "XF86AudioPlay", "XF86AudioRaiseVolume", "XF86AudioLowerVolume",
+}
+
+
+def send_remote_input(kind, payload):
+    """Dispatch mobile trackpad, click, scroll, whitelisted key, or text events to desktop."""
+    kind = str(kind or "").strip().lower()
+    if not isinstance(payload, dict):
+        payload = {}
+    env = get_desktop_env()
+    search_path = env["PATH"]
+    has_ydo = bool(find_bin("ydotool", search_path))
+    has_xdo = bool(find_bin("xdotool", search_path))
+    has_wtype = bool(find_bin("wtype", search_path))
+
+    if kind == "move":
+        try:
+            dx = max(-800, min(800, int(round(float(payload.get("dx", 0))))))
+            dy = max(-800, min(800, int(round(float(payload.get("dy", 0))))))
+        except (TypeError, ValueError):
+            return False, "Invalid mouse delta"
+        if has_ydo:
+            rc, _, err = run_as_user(["ydotool", "mousemove", "--", str(dx), str(dy)], timeout=3)
+            return rc == 0, ("ydotool" if rc == 0 else err)
+        if has_xdo:
+            rc, _, err = run_as_user(["xdotool", "mousemove_relative", "--", str(dx), str(dy)], timeout=3)
+            return rc == 0, ("xdotool" if rc == 0 else err)
+        return False, "Install ydotool (Wayland) or xdotool (X11) for remote cursor movement"
+
+    if kind == "click":
+        btn = str(payload.get("button", "left")).strip().lower()
+        btn_map_xdo = {"left": "1", "middle": "2", "right": "3"}
+        btn_map_ydo = {"left": "0xC0", "right": "0xC1", "middle": "0xC2"}
+        if btn not in btn_map_xdo:
+            return False, "Unsupported mouse button"
+        if has_ydo:
+            rc, _, err = run_as_user(["ydotool", "click", btn_map_ydo[btn]], timeout=3)
+            return rc == 0, ("ydotool" if rc == 0 else err)
+        if has_xdo:
+            rc, _, err = run_as_user(["xdotool", "click", btn_map_xdo[btn]], timeout=3)
+            return rc == 0, ("xdotool" if rc == 0 else err)
+        return False, "Install ydotool (Wayland) or xdotool (X11) for mouse click"
+
+    if kind == "scroll":
+        try:
+            dy = max(-20, min(20, int(round(float(payload.get("dy", 0))))))
+        except (TypeError, ValueError):
+            return False, "Invalid scroll delta"
+        if dy == 0:
+            return True, "noop"
+        if has_ydo:
+            rc, _, err = run_as_user(["ydotool", "mousemove", "-w", "--", "0", str(-dy)], timeout=3)
+            return rc == 0, ("ydotool" if rc == 0 else err)
+        if has_xdo:
+            btn = "4" if dy < 0 else "5"
+            rc, _, err = run_as_user(["xdotool", "click", "--repeat", str(abs(dy)), btn], timeout=3)
+            return rc == 0, ("xdotool" if rc == 0 else err)
+        return False, "Install ydotool or xdotool for remote scroll"
+
+    if kind == "key":
+        key = str(payload.get("key", "")).strip()
+        if key not in _ALLOWED_REMOTE_KEYS:
+            return False, "Unsupported key"
+        if has_wtype:
+            rc, _, err = run_as_user(["wtype", "-k", key], timeout=3)
+            if rc == 0:
+                return True, "wtype"
+        if has_xdo:
+            rc, _, err = run_as_user(["xdotool", "key", key], timeout=3)
+            return rc == 0, ("xdotool" if rc == 0 else err)
+        if has_ydo and key == "Return":
+            rc, _, err = run_as_user(["ydotool", "key", "28:1", "28:0"], timeout=3)
+            return rc == 0, ("ydotool" if rc == 0 else err)
+        return False, "Install wtype, ydotool, or xdotool for remote key input"
+
+    if kind == "text":
+        text = str(payload.get("text", ""))
+        if not text or len(text) > 1000:
+            return False, "Text must be 1-1000 characters"
+        return type_prompt_to_active_window(text, auto_enter=bool(payload.get("auto_enter", False)))
+
+    return False, "Unsupported remote input kind"
+
+
+def _discovery_worker():
+    """Respond to LAN UDP discovery broadcasts on DISCOVERY_PORT cleanly."""
+    if not DISCOVERY_ENABLED:
+        return
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(("0.0.0.0", DISCOVERY_PORT))
+    except OSError as e:
+        record_audit_event("WARN", f"LAN discovery UDP listener unavailable on port {DISCOVERY_PORT}: {e}")
+        return
+
+    record_audit_event("INFO", f"LAN discovery UDP listener active on port {DISCOVERY_PORT}")
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+            msg = data.decode("utf-8", errors="ignore").strip()
+            if msg == "MOBILE_RC_DISCOVER" or '"discover"' in msg.lower():
+                os_info = get_os_info()
+                reply = json.dumps({
+                    "service": "mobile-rc",
+                    "version": 2,
+                    "hostname": os_info.get("hostname", socket.gethostname()),
+                    "os": os_info.get("name", "Linux"),
+                    "port": PORT,
+                    "ips": get_local_ips(),
+                    "macs": get_mac_addresses(),
+                }).encode("utf-8")
+                sock.sendto(reply, addr)
+        except Exception:
+            time.sleep(0.2)
+
+
 def get_local_ips():
     ips = []
-    if shutil.which("ip"):
+    if find_bin("ip"):
         try:
             rc, out, _ = run_cmd(["ip", "-4", "-o", "addr", "show", "scope", "global"])
             if rc == 0 and out:
@@ -1002,7 +2546,7 @@ def get_local_ips():
                                 ips.append(ip_addr)
         except Exception:
             pass
-    if not ips and shutil.which("hostname"):
+    if not ips and find_bin("hostname"):
         try:
             rc, out, _ = run_cmd(["hostname", "-I"])
             if rc == 0 and out:
@@ -1052,9 +2596,10 @@ def _publish_ntfy(url):
 
 def _ensure_ssh_keypair():
     _ensure_config_dir()
-    if not os.path.exists(SSH_KEY_FILE) and shutil.which("ssh-keygen"):
+    keygen_bin = find_bin("ssh-keygen")
+    if not os.path.exists(SSH_KEY_FILE) and keygen_bin:
         subprocess.run(
-            ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", SSH_KEY_FILE],
+            [keygen_bin, "-t", "ed25519", "-N", "", "-f", SSH_KEY_FILE],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -1100,7 +2645,8 @@ def _tunnel_reader(proc):
 
 def start_tunnel():
     global _TUNNEL_PROC, _TUNNEL_URL, _TUNNEL_STATUS
-    if not shutil.which("ssh"):
+    ssh_bin = find_bin("ssh")
+    if not ssh_bin:
         with _TUNNEL_LOCK:
             _TUNNEL_STATUS = "unavailable (ssh not installed)"
         return get_tunnel_info()
@@ -1112,7 +2658,7 @@ def start_tunnel():
         _TUNNEL_URL = ""
         _TUNNEL_STATUS = "starting"
         cmd = [
-            "ssh",
+            ssh_bin,
             "-T",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"UserKnownHostsFile={SSH_KNOWN_HOSTS}",
@@ -1125,8 +2671,11 @@ def start_tunnel():
             cmd.extend(["-i", SSH_KEY_FILE])
         cmd.append("nokey@localhost.run")
 
+        tunnel_env = os.environ.copy()
+        tunnel_env["PATH"] = get_system_path()
         proc = subprocess.Popen(
             cmd,
+            env=tunnel_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1336,8 +2885,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   .btn-os { background: rgba(56, 189, 248, 0.12); border-color: rgba(56, 189, 248, 0.3); color: var(--accent); }
   .btn-arch { background: rgba(23, 147, 209, 0.15); border-color: rgba(23, 147, 209, 0.4); color: #38bdf8; }
+  .btn-cachyos { background: rgba(0, 212, 170, 0.14); border-color: rgba(0, 212, 170, 0.42); color: #2dd4bf; }
   .btn-garuda { background: rgba(240, 98, 146, 0.15); border-color: rgba(240, 98, 146, 0.4); color: #f472b6; }
   .btn-gentoo { background: rgba(168, 85, 247, 0.15); border-color: rgba(168, 85, 247, 0.4); color: #c084fc; }
+  .btn-nixos { background: rgba(126, 186, 228, 0.14); border-color: rgba(126, 186, 228, 0.42); color: #7ebae4; }
 
   input[type="range"] {
     width: 100%;
@@ -1391,8 +2942,42 @@ INDEX_HTML = r"""<!DOCTYPE html>
     flex-direction: column;
     align-items: center;
     gap: 3px;
-    padding: 6px 10px;
+    padding: 6px 4px;
+    flex: 1;
+    min-width: 0;
     border-radius: 10px;
+  }
+  .badge-pill {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    background: rgba(56,189,248,0.16);
+    color: var(--accent);
+    border: 1px solid rgba(56,189,248,0.35);
+  }
+  .log-line {
+    padding: 6px 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    word-break: break-word;
+  }
+  .log-err { color: #fca5a5; }
+  .log-warn { color: #fde68a; }
+  .log-info { color: #e2e8f0; }
+  textarea, select {
+    width: 100%;
+    background: rgba(0,0,0,0.28);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 13px;
+    font-family: inherit;
+    resize: vertical;
   }
   .nav-item.active { color: var(--accent); }
   .tab-pane { display: none; }
@@ -1465,13 +3050,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="login-card">
     <div class="os-badge" style="margin-bottom:10px"><span class="dot"></span> <span id="login-badge-text">Mobile-RC Locked</span></div>
     <div class="title" style="margin-bottom:6px">Enter Access Code</div>
-    <div class="subtitle" id="login-hint" style="margin-bottom:14px">Type <code>control-access</code> in Termux (or <code>sudo control-access</code> on your PC) to generate a random 6-digit one-time code.</div>
+    <div class="subtitle" id="login-hint" style="margin-bottom:14px">Run <code>sudo control-access</code> on your PC/Laptop and enter the 6-digit RAC below (or run <code>control-access</code> in Termux).</div>
     <div id="email-otp-box" style="display:none;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)">
       <input type="email" id="email-input" placeholder="Registered email address" autocomplete="email" style="margin-bottom:8px" onkeydown="if(event.key==='Enter')requestEmailCode()">
       <button id="send-email-btn" onclick="requestEmailCode()" style="width:100%;margin-bottom:6px">📧 Send Code to Email</button>
       <div id="email-otp-status" class="subtitle" style="min-height:16px"></div>
     </div>
-    <input type="password" id="pin-input" inputmode="numeric" maxlength="16" placeholder="6-digit code" autocomplete="current-password" style="text-align:center;font-size:18px;letter-spacing:4px;margin-bottom:8px" onkeydown="if(event.key==='Enter')submitLogin()">
+    <input type="password" id="pin-input" inputmode="numeric" maxlength="16" placeholder="6-digit RAC" autocomplete="one-time-code" style="text-align:center;font-size:18px;letter-spacing:4px;margin-bottom:8px" oninput="onPinInput(this)" onkeydown="if(event.key==='Enter')submitLogin()">
     <div class="login-err" id="login-err"></div>
     <button class="btn-primary" style="width:100%" onclick="submitLogin()">🔓 Unlock Dashboard</button>
   </div>
@@ -1486,8 +3071,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="subtitle" id="kernel-uptime">Kernel - • Uptime -</div>
     </div>
     <div style="text-align:right">
-      <div style="font-size:22px;font-weight:800" id="bat-top">--%</div>
-      <div class="subtitle" id="bat-status">Battery</div>
+      <div style="font-size:22px;font-weight:800" id="bat-top">--</div>
+      <div class="subtitle" id="bat-status">Power</div>
       <button id="logout-btn" onclick="doLogout()" style="margin-top:6px;padding:4px 9px;font-size:11px">🔒 Lock</button>
     </div>
   </div>
@@ -1510,9 +3095,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div class="stat-val" id="ram-val">0 GB</div>
         <div class="bar-bg"><div class="bar-fill" id="ram-bar" style="width:0%"></div></div>
       </div>
-      <div class="stat-box">
-        <div class="stat-label">BATTERY LEVEL</div>
-        <div class="stat-val" id="bat-val">0%</div>
+      <div class="stat-box" id="stat-power-card">
+        <div class="stat-label" id="bat-label">POWER / GPU</div>
+        <div class="stat-val" id="bat-val">--</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px" id="bat-sub">Swap: -- | Net: --</div>
         <div class="bar-bg"><div class="bar-fill" id="bat-bar" style="width:0%"></div></div>
       </div>
     </div>
@@ -1584,6 +3170,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <!-- TAB 3: MULTI-BOOT & POWER -->
   <div id="tab-boot" class="tab-pane">
     <div class="card">
+      <div class="card-title">
+        <span>Installed Distros &amp; Host Inventory</span>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button onclick="loadDistros(false, true)" style="padding:4px 10px;font-size:11px">Refresh</button>
+          <button onclick="loadDistros(true, true)" id="btn-deep-scan" style="padding:4px 10px;font-size:11px;border-color:rgba(56,189,248,0.45)">Scan Unmounted Partitions</button>
+        </div>
+      </div>
+      <div id="distro-host-summary" style="font-size:12px;color:var(--muted);margin-bottom:10px">Loading host environment...</div>
+      <div id="distro-list" style="display:flex;flex-direction:column;gap:8px"></div>
+    </div>
+    <div class="card">
       <div class="card-title"><span>🚀 Multi-Boot OS Switcher (UEFI BootNext)</span></div>
       <div id="boot-list" style="display:flex;flex-direction:column;gap:10px">
         <div style="color:var(--muted);font-size:13px">Scanning UEFI boot entries...</div>
@@ -1625,11 +3222,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     <div class="card">
       <div class="card-title"><span>⌨️ Quick Web Terminal</span></div>
-      <div style="display:flex;gap:8px">
-        <input type="text" id="cmd-input" placeholder="Example: fastfetch, df -h, sensors..." onkeydown="if(event.key==='Enter')runTerminal()">
-        <button class="btn-primary" onclick="runTerminal()">Run</button>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <input type="text" id="cmd-input" style="flex:1;min-width:180px" placeholder="Example: fastfetch, df -h, sensors, or chat prompt..." onkeydown="if(event.key==='Enter')runTerminal('shell')">
+        <button class="btn-primary" onclick="runTerminal('shell')">Run Silent</button>
+        <button onclick="runTerminal('shell_gui')" style="border-color:rgba(56,189,248,0.45)">Open on Screen</button>
+        <button onclick="runTerminal('shell_type')">Type to Active</button>
       </div>
-      <pre class="term" id="term-out">Ready to execute commands on remote machine...</pre>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-bottom:8px;cursor:pointer">
+        <input type="checkbox" id="cmd-auto-enter" checked style="width:auto">
+        <span>Auto-Enter when typing into active desktop window (uncheck to preview before pressing Enter)</span>
+      </label>
+      <pre class="term" id="term-out">Ready to execute commands or send prompts to your Linux host...</pre>
     </div>
   </div>
 
@@ -1665,6 +3268,68 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
       <div id="file-list">Loading files...</div>
     </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>Feedback, Suggestions &amp; Bug Reports</span>
+        <span class="badge-pill">brypra4@gmail.com</span>
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+        Send suggestions, feature ideas, or bug reports directly to the maintainer inbox.
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <select id="fb-category">
+          <option value="suggestion">Suggestion / Feature Idea</option>
+          <option value="bug">Bug Report</option>
+          <option value="other">Other Question / Feedback</option>
+        </select>
+        <input type="text" id="fb-subject" maxlength="120" placeholder="Short summary / subject">
+        <input type="email" id="fb-reply" maxlength="120" placeholder="Your email (optional, for reply)">
+        <textarea id="fb-message" rows="4" maxlength="4000" placeholder="Describe your suggestion, issue, or steps to reproduce..."></textarea>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer">
+          <input type="checkbox" id="fb-sysinfo" checked style="width:auto">
+          <span>Attach host OS / init / compositor info (no IPs or tokens)</span>
+        </label>
+        <button class="btn-primary" onclick="submitFeedback()" id="fb-submit-btn">Send Feedback</button>
+      </div>
+      <div id="fb-status" style="font-size:12px;margin-top:10px;color:var(--muted)"></div>
+      <div id="fb-fallbacks" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div>
+    </div>
+  </div>
+
+  <!-- TAB 5: SYSTEM LOGS -->
+  <div id="tab-logs" class="tab-pane">
+    <div class="card">
+      <div class="card-title">
+        <span>System Logs &amp; Audit Events</span>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span class="badge-pill" id="logs-init-badge">init: --</span>
+          <button onclick="loadLogs()" style="padding:4px 10px;font-size:11px">Refresh</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+        <select id="log-source" onchange="loadLogs()">
+          <option value="all">All Sources</option>
+          <option value="mobile-rc">Mobile-RC Audit</option>
+          <option value="journal">systemd journal</option>
+          <option value="openrc">OpenRC rc.log</option>
+          <option value="syslog">Syslog / messages</option>
+          <option value="dmesg">Kernel dmesg</option>
+        </select>
+        <select id="log-level" onchange="loadLogs()">
+          <option value="all">All Severities</option>
+          <option value="err">Errors Only</option>
+          <option value="warn">Warnings &amp; Errors</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <input type="text" id="log-query" placeholder="Filter log message..." onkeydown="if(event.key==='Enter')loadLogs()">
+        <button onclick="loadLogs()">Filter</button>
+      </div>
+      <div id="logs-list" style="max-height:420px;overflow-y:auto;background:rgba(0,0,0,0.28);border:1px solid var(--border);border-radius:10px">
+        <div style="padding:12px;color:var(--muted);font-size:12px">Open Logs tab or tap Refresh to load host logs...</div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1672,9 +3337,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div class="bottom-nav">
   <button class="nav-item active" onclick="switchTab('monitor', this)"><span>📊</span><span>Monitor</span></button>
   <button class="nav-item" onclick="switchTab('media', this)"><span>🎵</span><span>Media</span></button>
-  <button class="nav-item" onclick="switchTab('boot', this)"><span>🚀</span><span>Multi-Boot</span></button>
+  <button class="nav-item" onclick="switchTab('boot', this)"><span>🚀</span><span>Boot/OS</span></button>
   <button class="nav-item" onclick="switchTab('remote', this)"><span>⌨️</span><span>Remote</span></button>
-  <button class="nav-item" onclick="switchTab('network', this)"><span>🌍</span><span>Files &amp; Net</span></button>
+  <button class="nav-item" onclick="switchTab('logs', this)"><span>LOG</span><span>Logs</span></button>
+  <button class="nav-item" onclick="switchTab('network', this)"><span>🌍</span><span>Net &amp; Feed</span></button>
 </div>
 
 <script>
@@ -1752,10 +3418,32 @@ function hideLogin() {
   refreshScreenshot(true);
 }
 
+let _pinMode = 'on_demand';
+let _loginBusy = false;
+
+function onPinInput(el) {
+  if (!el) return;
+  if (_pinMode !== 'static') {
+    const digits = el.value.replace(/\D+/g, '').slice(0, 6);
+    if (el.value !== digits) el.value = digits;
+    if (digits.length === 6 && !_loginBusy) {
+      submitLogin();
+    }
+  }
+}
+
 async function initAuth() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const handoff = (urlParams.get('handoff') || hashParams.get('handoff') || '').trim();
+  const autoRac = (urlParams.get('rac') || hashParams.get('rac') || '').trim();
+  if (handoff || autoRac) {
+    window.history.replaceState(null, '', window.location.pathname);
+  }
   try {
     const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
     const d = await r.json();
+    if (d && d.pin_mode) _pinMode = d.pin_mode;
     const hint = document.getElementById('login-hint');
     const badge = document.getElementById('login-badge-text');
     const emailBox = document.getElementById('email-otp-box');
@@ -1764,16 +3452,20 @@ async function initAuth() {
       if (badge) badge.textContent = 'Mobile-RC • Online Access';
       if (d.email_otp_enabled) {
         if (emailBox) emailBox.style.display = 'block';
-        if (hint) hint.textContent = 'Remote access detected. Enter your registered email to receive a 6-digit OTP code, or enter a code generated on your PC/Termux.';
+        if (hint) hint.textContent = 'Different network detected. Enter your registered email to receive a 6-digit RAC (auto-unlocks on 6th digit).';
       } else {
         if (emailBox) emailBox.style.display = 'none';
-        if (hint) hint.innerHTML = 'Remote access detected. Enter a code from <code>control-access</code> (or run <code>sudo control-access --setup-email</code> on PC to enable Email OTP).';
+        if (hint) hint.textContent = 'Different network detected. Configure Email OTP on PC via: sudo control-access --setup-email';
       }
     } else {
       if (badge) badge.textContent = 'Mobile-RC • Local LAN';
       if (emailBox) emailBox.style.display = 'none';
-      if (hint && d && d.pin_mode === 'static') {
-        hint.innerHTML = 'Enter the configured PIN stored in <code>/opt/mobile-rc/pin.txt</code> on your PC.';
+      if (hint) {
+        if (d && d.pin_mode === 'static') {
+          hint.textContent = 'Enter the configured PIN stored in /opt/mobile-rc/pin.txt on your PC.';
+        } else {
+          hint.textContent = 'Local network: run sudo control-access on your PC/Laptop and enter the 6-digit RAC below (auto-unlocks on 6th digit).';
+        }
       }
     }
     if (emailStatus) emailStatus.textContent = '';
@@ -1781,6 +3473,29 @@ async function initAuth() {
       _csrfToken = d.csrf_token;
       hideLogin();
       return;
+    }
+    if (handoff) {
+      const hr = await fetch('/api/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ handoff_token: handoff }),
+      });
+      const hd = await hr.json();
+      if (hr.ok && hd.ok && hd.csrf_token) {
+        _csrfToken = hd.csrf_token;
+        hideLogin();
+        toast('Unlocked!');
+        return;
+      }
+    }
+    if (autoRac && /^\d{6}$/.test(autoRac)) {
+      const pinEl = document.getElementById('pin-input');
+      if (pinEl) {
+        pinEl.value = autoRac;
+        await submitLogin();
+        if (_authenticated) return;
+      }
     }
   } catch (e) {}
   showLogin('');
@@ -1833,12 +3548,14 @@ async function requestEmailCode() {
 }
 
 async function submitLogin() {
+  if (_loginBusy) return;
   const pin = document.getElementById('pin-input').value.trim();
   const errEl = document.getElementById('login-err');
   if (!pin) {
-    errEl.textContent = 'Please enter your access PIN.';
+    errEl.textContent = 'Please enter your access code.';
     return;
   }
+  _loginBusy = true;
   errEl.textContent = 'Verifying...';
   try {
     const r = await fetch('/api/login', {
@@ -1857,6 +3574,8 @@ async function submitLogin() {
     }
   } catch (e) {
     errEl.textContent = 'Connection error';
+  } finally {
+    _loginBusy = false;
   }
 }
 
@@ -1880,6 +3599,8 @@ function switchTab(name, btn) {
     clearTimeout(_liveTimer);
     _liveTimer = null;
   }
+  if (name === 'boot') loadDistros(false, false);
+  if (name === 'logs') loadLogs();
   if (name === 'network') loadFiles();
 }
 
@@ -1928,10 +3649,38 @@ async function refreshStatus() {
     document.getElementById('ram-val').textContent = `${d.ram.used_gb}/${d.ram.total_gb} GB`;
     document.getElementById('ram-bar').style.width = d.ram.percent + '%';
 
-    document.getElementById('bat-val').textContent = d.battery.percent + '%';
-    document.getElementById('bat-bar').style.width = d.battery.percent + '%';
-    document.getElementById('bat-top').textContent = (d.battery.plugged ? '⚡' : '') + d.battery.percent + '%';
-    document.getElementById('bat-status').textContent = d.battery.status;
+    const bat = d.battery || {};
+    const gpu = d.gpu || {};
+    const swap = d.swap || {};
+    const net = d.network || {};
+    const batLabelEl = document.getElementById('bat-label');
+    const batSubEl = document.getElementById('bat-sub');
+    const batBarEl = document.getElementById('bat-bar');
+    if (bat.percent !== null && bat.percent !== undefined) {
+      batLabelEl.textContent = bat.has_ups ? 'UPS BACKUP' : 'BATTERY LEVEL';
+      document.getElementById('bat-val').textContent = bat.percent + '%';
+      batBarEl.style.width = bat.percent + '%';
+      document.getElementById('bat-top').textContent = (bat.plugged ? '⚡' : '') + bat.percent + '%';
+      document.getElementById('bat-status').textContent = bat.status || 'Battery';
+    } else {
+      batLabelEl.textContent = gpu.available ? 'DESKTOP / GPU' : 'HOST POWER';
+      let gpuVal = 'AC';
+      let barPct = 100;
+      if (gpu.busy_pct !== null && gpu.busy_pct !== undefined) {
+        gpuVal = gpu.busy_pct + '%';
+        barPct = Math.max(0, Math.min(100, gpu.busy_pct));
+      } else if (gpu.temp_c !== null && gpu.temp_c !== undefined) {
+        gpuVal = gpu.temp_c + ' C';
+        barPct = Math.min(100, Math.round(gpu.temp_c));
+      }
+      document.getElementById('bat-val').textContent = gpuVal;
+      batBarEl.style.width = barPct + '%';
+      document.getElementById('bat-top').textContent = 'AC';
+      document.getElementById('bat-status').textContent = (gpu.temp_c !== null && gpu.temp_c !== undefined) ? (gpu.temp_c + ' C GPU') : (bat.status || 'AC Desktop');
+    }
+    const swapTxt = (swap.total_gb > 0) ? ('Swap ' + swap.used_gb + '/' + swap.total_gb + 'GB') : 'Swap off';
+    const netTxt = 'Net RX ' + (net.rx_kbps ?? 0) + ' / TX ' + (net.tx_kbps ?? 0) + ' KiB/s';
+    if (batSubEl) batSubEl.textContent = swapTxt + ' | ' + netTxt;
 
     document.getElementById('vol-label').textContent = (d.media.muted ? '🔇 ' : '') + d.media.volume + '%';
     document.getElementById('vol-slider').value = d.media.volume;
@@ -2012,7 +3761,9 @@ async function refreshStatus() {
         let btnClass = 'btn-os';
         let icon = '🚀';
         const n = String(e.name || '').toLowerCase();
-        if (n.includes('arch')) { btnClass = 'btn-arch'; icon = '🔵'; }
+        if (n.includes('cachyos') || n.includes('cachy')) { btnClass = 'btn-cachyos'; icon = ''; }
+        else if (n.includes('nixos')) { btnClass = 'btn-nixos'; icon = ''; }
+        else if (n.includes('arch')) { btnClass = 'btn-arch'; icon = '🔵'; }
         else if (n.includes('garuda')) { btnClass = 'btn-garuda'; icon = '🦅'; }
         else if (n.includes('gentoo')) { btnClass = 'btn-gentoo'; icon = '🟣'; }
         else if (n.includes('ubuntu')) { icon = '🟠'; }
@@ -2023,7 +3774,7 @@ async function refreshStatus() {
         btn.className = btnClass;
         btn.style.cssText = 'justify-content:space-between;padding:16px';
         const spanLeft = document.createElement('span');
-        spanLeft.appendChild(document.createTextNode(`${icon} `));
+        if (icon) spanLeft.appendChild(document.createTextNode(`${icon} `));
         const bold = document.createElement('b');
         bold.textContent = `Boot into ${e.name}`;
         spanLeft.appendChild(bold);
@@ -2186,11 +3937,179 @@ async function sendInput(type) {
   document.getElementById('msg-input').value = '';
 }
 
-async function runTerminal() {
+function _appendSectionHeader(parent, title) {
+  const h = document.createElement('div');
+  h.style.cssText = 'font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;margin-top:6px';
+  h.textContent = title;
+  parent.appendChild(h);
+}
+
+function _appendKvRow(parent, leftText, rightText) {
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:8px;padding:7px 9px;background:rgba(0,0,0,0.22);border-radius:8px;font-size:12px';
+  const l = document.createElement('div');
+  l.style.fontWeight = '600';
+  l.textContent = leftText;
+  const r = document.createElement('div');
+  r.style.cssText = 'color:var(--muted);font-size:11px;text-align:right';
+  r.textContent = rightText;
+  row.appendChild(l);
+  row.appendChild(r);
+  parent.appendChild(row);
+}
+
+async function loadDistros(deep, refresh) {
+  const sumEl = document.getElementById('distro-host-summary');
+  const listEl = document.getElementById('distro-list');
+  const btn = document.getElementById('btn-deep-scan');
+  if (!sumEl || !listEl) return;
+  if (deep && btn) {
+    btn.disabled = true;
+    btn.textContent = 'Scanning Unmounted...';
+  }
+  const qs = '?deep=' + (deep ? '1' : '0') + (refresh ? '&refresh=1' : '');
+  const d = await api('/api/distros' + qs);
+  if (deep && btn) {
+    btn.disabled = false;
+    btn.textContent = 'Scan Unmounted Partitions';
+  }
+  if (!d || d.ok === false && d.status) {
+    sumEl.textContent = 'Failed to scan host OS inventory.';
+    return;
+  }
+  const h = d.host || {};
+  sumEl.textContent = [h.name || 'Linux', 'Init: ' + (h.init_system || 'unknown'), 'Compositor: ' + (h.compositor || 'unknown'), 'Kernel: ' + (h.kernel || '-'), h.cpu_model || '', h.gpu_name || ''].filter(Boolean).join(' | ');
+  listEl.textContent = '';
+
+  _appendSectionHeader(listEl, 'Detected Operating Systems (' + (d.detected_distros || []).length + ')');
+  (d.detected_distros || []).forEach(item => {
+    _appendKvRow(listEl, item.name || 'Linux', (item.source || '') + (item.detail ? (' - ' + item.detail) : ''));
+  });
+
+  if (d.unmounted_distros && d.unmounted_distros.length > 0) {
+    _appendSectionHeader(listEl, 'Unmounted Partition Probe Results');
+    d.unmounted_distros.forEach(u => {
+      _appendKvRow(listEl, u.name + ' (' + (u.subvolume || '/') + ')', u.device + ' [' + u.fstype + ']');
+    });
+  } else if (d.deep_scan) {
+    _appendKvRow(listEl, 'Unmounted Linux Partitions', 'No additional OS roots found on unmounted partitions');
+  }
+
+  if (d.bootloader_entries && d.bootloader_entries.length > 0) {
+    _appendSectionHeader(listEl, 'Bootloader Config Entries');
+    d.bootloader_entries.slice(0, 12).forEach(b => {
+      _appendKvRow(listEl, b.title || b.file, b.loader + (b.kernel ? (' | ' + b.kernel) : ''));
+    });
+  }
+
+  if (d.filesystems && d.filesystems.length > 0) {
+    _appendSectionHeader(listEl, 'Mounted Filesystems');
+    d.filesystems.slice(0, 12).forEach(fs => {
+      _appendKvRow(listEl, fs.target || '/', (fs.fstype || '') + ' (' + (fs.source || '') + ')');
+    });
+  }
+
+  if (d.scan_errors && d.scan_errors.length > 0) {
+    _appendSectionHeader(listEl, 'Scan Notes');
+    d.scan_errors.forEach(err => {
+      _appendKvRow(listEl, 'Warning', String(err));
+    });
+  }
+}
+
+async function loadLogs() {
+  const listEl = document.getElementById('logs-list');
+  const badgeEl = document.getElementById('logs-init-badge');
+  if (!listEl) return;
+  const src = document.getElementById('log-source').value;
+  const lvl = document.getElementById('log-level').value;
+  const q = document.getElementById('log-query').value.trim();
+  const qs = '?source=' + encodeURIComponent(src) + '&level=' + encodeURIComponent(lvl) + '&q=' + encodeURIComponent(q) + '&lines=120';
+  const d = await api('/api/logs' + qs);
+  if (!d || d.ok === false && d.status) {
+    listEl.textContent = '';
+    const errDiv = document.createElement('div');
+    errDiv.style.padding = '12px';
+    errDiv.textContent = d.message || 'Unable to load system logs.';
+    listEl.appendChild(errDiv);
+    return;
+  }
+  if (badgeEl) badgeEl.textContent = 'init: ' + (d.init_system || 'unknown');
+  listEl.textContent = '';
+  const items = d.entries || [];
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'padding:12px;color:var(--muted);font-size:12px';
+    empty.textContent = 'No log lines matched this filter.';
+    listEl.appendChild(empty);
+    return;
+  }
+  items.slice().reverse().forEach(entry => {
+    const row = document.createElement('div');
+    const lvlStr = String(entry.level || 'INFO').toUpperCase();
+    const cls = lvlStr.includes('ERR') || lvlStr.includes('CRIT') || lvlStr.includes('FATAL') ? 'log-err' : (lvlStr.includes('WARN') ? 'log-warn' : 'log-info');
+    row.className = 'log-line ' + cls;
+    const prefix = [entry.ts, '[' + (entry.source || 'sys') + ']', '[' + lvlStr + ']'].filter(Boolean).join(' ');
+    row.textContent = prefix + ' ' + (entry.message || '');
+    listEl.appendChild(row);
+  });
+}
+
+async function submitFeedback() {
+  const statusEl = document.getElementById('fb-status');
+  const fbLinksEl = document.getElementById('fb-fallbacks');
+  const btn = document.getElementById('fb-submit-btn');
+  const subject = document.getElementById('fb-subject').value.trim();
+  const message = document.getElementById('fb-message').value.trim();
+  if (!subject || !message) {
+    statusEl.style.color = '#fde68a';
+    statusEl.textContent = 'Please fill in both Subject and Feedback details.';
+    return;
+  }
+  btn.disabled = true;
+  statusEl.style.color = 'var(--muted)';
+  statusEl.textContent = 'Sending feedback...';
+  fbLinksEl.textContent = '';
+  const r = await api('/api/feedback', 'POST', {
+    category: document.getElementById('fb-category').value,
+    subject,
+    message,
+    reply_to: document.getElementById('fb-reply').value.trim(),
+    include_sysinfo: document.getElementById('fb-sysinfo').checked,
+  });
+  btn.disabled = false;
+  if (r.ok) {
+    statusEl.style.color = '#86efac';
+    statusEl.textContent = r.message || 'Feedback delivered to brypra4@gmail.com.';
+    document.getElementById('fb-subject').value = '';
+    document.getElementById('fb-message').value = '';
+    return;
+  }
+  statusEl.style.color = '#fde68a';
+  statusEl.textContent = r.message || 'Use an option below to deliver directly to brypra4@gmail.com.';
+  const makeLinkBtn = (label, url, primary) => {
+    if (!url || !(url.startsWith('mailto:') || url.startsWith('https://'))) return;
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = label;
+    a.style.cssText = 'display:inline-block;padding:8px 12px;border-radius:10px;text-decoration:none;font-size:12px;font-weight:700;' + (primary ? 'background:var(--accent);color:#0f172a' : 'background:rgba(255,255,255,0.08);color:var(--text);border:1px solid var(--border)');
+    fbLinksEl.appendChild(a);
+  };
+  makeLinkBtn('Open Email App (brypra4@gmail.com)', r.mailto, true);
+  makeLinkBtn('Open Pre-Filled GitHub Issue', r.github_issue, false);
+}
+
+async function runTerminal(mode) {
+  const actType = mode || 'shell';
   const cmd = document.getElementById('cmd-input').value.trim();
   if (!cmd) return;
-  document.getElementById('term-out').textContent = 'Running: ' + cmd + ' ...';
-  const r = await api('/api/action', 'POST', { type: 'shell', value: cmd });
+  const autoEnter = document.getElementById('cmd-auto-enter') ? document.getElementById('cmd-auto-enter').checked : true;
+  document.getElementById('term-out').textContent = 'Running (' + actType + '): ' + cmd + ' ...';
+  const payload = { type: actType, value: cmd };
+  if (actType === 'shell_type') payload.auto_enter = autoEnter;
+  const r = await api('/api/action', 'POST', payload);
   document.getElementById('term-out').textContent = r.output || r.message || '(No output returned)';
 }
 
@@ -2294,6 +4213,19 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             return False
 
+    def _is_loopback_request(self):
+        """Ensure request originates strictly from host loopback (127.0.0.1 / ::1) with no proxy headers."""
+        peer = self.client_address[0] if self.client_address else ""
+        try:
+            if not ipaddress.ip_address(str(peer).strip()).is_loopback:
+                return False
+        except ValueError:
+            return False
+        for hdr in ("Cf-Connecting-Ip", "Cf-Ray", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded"):
+            if (self.headers.get(hdr) or "").strip():
+                return False
+        return True
+
     def _is_non_local_request(self):
         """Detect remote/online connections (e.g. Cloudflared tunnel, external proxy, public IP)."""
         peer = self.client_address[0] if self.client_address else ""
@@ -2348,6 +4280,21 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         return data
 
     def _get_session(self):
+        auth_hdr = (self.headers.get("Authorization") or "").strip()
+        if auth_hdr.startswith("Bearer "):
+            raw_tok = auth_hdr[7:].strip()
+            parsed_path = urllib.parse.urlparse(self.path).path
+            if raw_tok and parsed_path.startswith("/api/"):
+                dev = verify_mobile_device_token(raw_tok)
+                if dev is not None:
+                    return f"bearer:{dev.get('id', 'device')}", {
+                        "csrf": "",
+                        "ip": self._client_ip(),
+                        "is_bearer": True,
+                        "device": dev,
+                        "exp": time.time() + SESSION_TTL_SEC,
+                    }
+            return None, None
         raw_cookie = self.headers.get("Cookie", "")
         if not raw_cookie:
             return None, None
@@ -2395,6 +4342,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         return True
 
     def _require_csrf(self, sess):
+        if sess and sess.get("is_bearer") is True:
+            return True
         if not self._check_origin():
             return False
         supplied = (self.headers.get("X-CSRF-Token") or "").strip()
@@ -2457,6 +4406,12 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             script_candidates = [
                 os.path.join(CONFIG_DIR, "termux-control-access.sh"),
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "termux", "control-access"),
+                os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "share",
+                    "mobile-rc",
+                    "termux-control-access.sh",
+                ),
             ]
             for cand in script_candidates:
                 if os.path.isfile(cand):
@@ -2492,10 +4447,14 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/status":
             data = {
                 "os": get_os_info(),
+                "init_system": detect_init_system(),
                 "cpu_pct": get_cpu_percent(),
                 "cpu_temp": get_cpu_temp(),
                 "ram": get_memory_info(),
+                "swap": get_swap_info(),
+                "gpu": get_gpu_info(),
                 "battery": get_battery_info(),
+                "network": get_network_telemetry(),
                 "media": get_media_and_display(),
                 "workspaces": get_workspaces_info(),
                 "disks": get_disks_info(),
@@ -2504,6 +4463,48 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 "tunnel": get_tunnel_info(),
             }
             self._send_json(data)
+            return
+
+        if path == "/api/telemetry":
+            self._send_json({
+                "os": get_os_info(),
+                "init_system": detect_init_system(),
+                "cpu_pct": get_cpu_percent(),
+                "cpu_temp": get_cpu_temp(),
+                "ram": get_memory_info(),
+                "swap": get_swap_info(),
+                "gpu": get_gpu_info(),
+                "battery": get_battery_info(),
+                "network": get_network_telemetry(),
+                "disks": get_disks_info(),
+            })
+            return
+
+        if path == "/api/logs":
+            src = qs.get("source", ["all"])[0]
+            lvl = qs.get("level", ["all"])[0]
+            q = qs.get("q", [""])[0]
+            lines = qs.get("lines", ["120"])[0]
+            self._send_json(get_system_logs(source=src, level=lvl, query=q, lines=lines))
+            return
+
+        if path == "/api/distros":
+            deep = qs.get("deep", ["0"])[0].strip().lower() in ("1", "true", "yes")
+            refresh = qs.get("refresh", ["0"])[0].strip().lower() in ("1", "true", "yes")
+            self._send_json(get_installed_distros_info(deep=deep, refresh=refresh))
+            return
+
+        if path == "/api/services":
+            self._send_json(get_services_info())
+            return
+
+        if path == "/api/processes":
+            limit = qs.get("limit", ["30"])[0]
+            self._send_json(get_processes_info(limit=limit))
+            return
+
+        if path == "/api/mobile/devices":
+            self._send_json({"ok": True, "devices": list_mobile_devices()})
             return
 
         if path == "/api/screenshot":
@@ -2518,16 +4519,23 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 raw_path = os.path.join(tmpdir, "raw.png")
                 shot_path = os.path.join(tmpdir, "shot.jpg")
 
+                env = get_desktop_env()
+                comp = get_active_compositor(env)
                 capture_cmds = [
                     ["grim", raw_path],
+                    ["wayshot", "-f", raw_path],
                     ["spectacle", "-b", "-n", "-o", raw_path],
                     ["gnome-screenshot", "-f", raw_path],
                     ["maim", raw_path],
                     ["scrot", raw_path],
                     ["import", "-window", "root", raw_path],
                 ]
+                if comp == "kde":
+                    capture_cmds.insert(0, capture_cmds.pop(2))
+                elif comp == "gnome":
+                    capture_cmds.insert(0, capture_cmds.pop(3))
                 for cmd in capture_cmds:
-                    if not shutil.which(cmd[0]):
+                    if not find_bin(cmd[0], env["PATH"]):
                         continue
                     rc, _, _ = run_as_user(cmd, timeout=8, shell=False)
                     if rc == 0 and os.path.isfile(raw_path) and os.path.getsize(raw_path) > 1000:
@@ -2630,7 +4638,98 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
 
+        if path == "/api/mobile/pair":
+            if not self._check_origin():
+                return
+            ip = self._client_ip()
+            now = time.time()
+            wait_sec = self._check_rate_limit(_PAIRING_ATTEMPTS, ip, now)
+            if wait_sec:
+                self._send_json(
+                    {"ok": False, "message": f"Too many pairing attempts. Try again in {wait_sec}s."},
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                )
+                return
+
+            try:
+                data = self._read_json()
+            except _PayloadTooLargeError as e:
+                self._send_json({"ok": False, "message": str(e)}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            except _BadRequestError as e:
+                self._send_json({"ok": False, "message": str(e)}, HTTPStatus.BAD_REQUEST)
+                return
+
+            device_name = str(data.get("device_name", "Mobile-RC App")).strip()
+            auth_hdr = (self.headers.get("Authorization") or "").strip()
+            supplied_tok = auth_hdr[7:].strip() if auth_hdr.startswith("Bearer ") else str(data.get("pairing_token", "")).strip()
+            expected_tok = get_termux_token()
+            authorized = False
+            used_pin_auth = False
+
+            if supplied_tok and self._is_loopback_request() and hmac.compare_digest(supplied_tok, expected_tok):
+                authorized = True
+            elif "pin" in data:
+                used_pin_auth = True
+                pin_ok, _ = _verify_login_code(
+                    str(data.get("pin", "")),
+                    require_email=self._is_non_local_request(),
+                )
+                if pin_ok:
+                    authorized = True
+            else:
+                _, sess = self._get_session()
+                if sess:
+                    if sess.get("is_bearer") is True:
+                        authorized = True
+                    else:
+                        supplied_csrf = (self.headers.get("X-CSRF-Token") or "").strip()
+                        if supplied_csrf and hmac.compare_digest(supplied_csrf, sess["csrf"]):
+                            authorized = True
+
+            if not authorized:
+                locked = self._record_auth_failure(
+                    _PAIRING_ATTEMPTS,
+                    ip,
+                    now,
+                    invalidate_code=(used_pin_auth and get_pin_mode() != "static"),
+                )
+                if locked:
+                    self._send_json(
+                        {"ok": False, "message": f"Too many invalid attempts. Locked for {LOGIN_LOCKOUT_SEC}s."},
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                    )
+                    return
+                self._send_json({"ok": False, "message": "Invalid pairing token or PIN"}, HTTPStatus.UNAUTHORIZED)
+                return
+
+            with _AUTH_LOCK:
+                _PAIRING_ATTEMPTS.pop(ip, None)
+            dev_id, raw_device_token = register_mobile_device(device_name)
+            self._send_json({
+                "ok": True,
+                "token": raw_device_token,
+                "device_id": dev_id,
+                "device": {"id": dev_id, "name": device_name or "Mobile-RC App"},
+                "host": get_os_info(),
+                "init_system": detect_init_system(),
+                "macs": get_mac_addresses(),
+                "ips": get_local_ips(),
+                "port": PORT,
+            })
+            return
+
         if path == "/api/pairing/code":
+            if not self._is_loopback_request():
+                record_audit_event("WARN", f"Blocked non-loopback RAC generation attempt from {self._client_ip()}")
+                self._send_json(
+                    {
+                        "ok": False,
+                        "message": "Random Access Code (RAC) can only be generated on the host PC/Laptop (sudo control-access).",
+                    },
+                    HTTPStatus.FORBIDDEN,
+                )
+                return
             if not self._check_origin():
                 return
             ip = self._client_ip()
@@ -2762,11 +4861,43 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 )
                 return
 
+            handoff_in = str(data.get("handoff_token", "")).strip()
+            if handoff_in:
+                with _AUTH_LOCK:
+                    expired_h = [k for k, v in _HANDOFF_TICKETS.items() if now >= v["expires"]]
+                    for k in expired_h:
+                        _HANDOFF_TICKETS.pop(k, None)
+                    ticket = _HANDOFF_TICKETS.pop(handoff_in, None)
+                if ticket and now < ticket["expires"]:
+                    session_token = secrets.token_urlsafe(32)
+                    csrf_token = secrets.token_urlsafe(24)
+                    with _AUTH_LOCK:
+                        _LOGIN_ATTEMPTS.pop(ip, None)
+                        _SESSIONS[session_token] = {
+                            "expires": now + SESSION_TTL_SEC,
+                            "csrf": csrf_token,
+                            "ip": ip,
+                        }
+                    cookie_val = (
+                        f"mrc_session={session_token}; HttpOnly; SameSite=Strict; "
+                        f"Path=/; Max-Age={SESSION_TTL_SEC}"
+                    )
+                    self._send_json(
+                        {"ok": True, "csrf_token": csrf_token},
+                        HTTPStatus.OK,
+                        extra_headers={"Set-Cookie": cookie_val},
+                    )
+                    return
+                self._send_json({"ok": False, "message": "Invalid or expired login ticket"}, HTTPStatus.UNAUTHORIZED)
+                return
+
+            is_remote = self._is_non_local_request()
             supplied_pin = str(data.get("pin", "")).strip()
-            ok, reason = _verify_login_code(supplied_pin)
+            ok, reason = _verify_login_code(supplied_pin, require_email=is_remote)
             if ok:
                 session_token = secrets.token_urlsafe(32)
                 csrf_token = secrets.token_urlsafe(24)
+                handoff_out = ""
                 with _AUTH_LOCK:
                     _LOGIN_ATTEMPTS.pop(ip, None)
                     expired = [k for k, v in _SESSIONS.items() if now >= v["expires"]]
@@ -2777,12 +4908,21 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                         "csrf": csrf_token,
                         "ip": ip,
                     }
+                    if bool(data.get("handoff", False)):
+                        handoff_out = secrets.token_urlsafe(24)
+                        _HANDOFF_TICKETS[handoff_out] = {
+                            "expires": now + 45.0,
+                            "ip": ip,
+                        }
                 cookie_val = (
                     f"mrc_session={session_token}; HttpOnly; SameSite=Strict; "
                     f"Path=/; Max-Age={SESSION_TTL_SEC}"
                 )
+                resp_payload = {"ok": True, "csrf_token": csrf_token}
+                if handoff_out:
+                    resp_payload["handoff_token"] = handoff_out
                 self._send_json(
-                    {"ok": True, "csrf_token": csrf_token},
+                    resp_payload,
                     HTTPStatus.OK,
                     extra_headers={"Set-Cookie": cookie_val},
                 )
@@ -2796,17 +4936,16 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 )
                 return
 
-            is_remote = self._is_non_local_request()
             if is_remote:
                 msg_map = {
-                    "missing": "No active code. Request an Email OTP above or use 'control-access' first.",
-                    "expired": "Code expired. Request a new code to continue.",
+                    "missing": "No active Email RAC. Request a 6-digit code via Email above first.",
+                    "expired": "Email RAC expired. Request a new Email code to continue.",
                     "invalid": "Invalid code",
                 }
             else:
                 msg_map = {
-                    "missing": "No active code. Run 'control-access' in Termux first.",
-                    "expired": "Code expired. Run 'control-access' in Termux for a new one.",
+                    "missing": "No active RAC. Run 'sudo control-access' on your PC/Laptop first.",
+                    "expired": "RAC expired. Run 'sudo control-access' on your PC/Laptop for a new one.",
                     "invalid": "Invalid code",
                 }
             self._send_json({"ok": False, "message": msg_map.get(reason, "Invalid code")}, HTTPStatus.UNAUTHORIZED)
@@ -2950,22 +5089,22 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"],
                 ])
             elif act == "bright_up":
-                rc, _, _ = run_first_available([["brightnessctl", "set", "+10%"], ["light", "-A", "10"]])
-                if rc != 0:
-                    run_first_system_cmd([["brightnessctl", "set", "+10%"], ["light", "-A", "10"]])
+                if not _adjust_brightness("up"):
+                    self._send_json({"ok": False, "message": "Brightness control unavailable (internal backlight or ddcutil required)"}, HTTPStatus.NOT_IMPLEMENTED)
+                    return
             elif act == "bright_down":
-                rc, _, _ = run_first_available([["brightnessctl", "set", "10%-"], ["light", "-U", "10"]])
-                if rc != 0:
-                    run_first_system_cmd([["brightnessctl", "set", "10%-"], ["light", "-U", "10"]])
+                if not _adjust_brightness("down"):
+                    self._send_json({"ok": False, "message": "Brightness control unavailable (internal backlight or ddcutil required)"}, HTTPStatus.NOT_IMPLEMENTED)
+                    return
             elif act == "bright_set":
                 try:
                     pct = max(5, min(100, int(float(val))))
                 except (TypeError, ValueError):
                     self._send_json({"ok": False, "message": "Invalid brightness value"}, HTTPStatus.BAD_REQUEST)
                     return
-                rc, _, _ = run_first_available([["brightnessctl", "set", f"{pct}%"], ["light", "-S", str(pct)]])
-                if rc != 0:
-                    run_first_system_cmd([["brightnessctl", "set", f"{pct}%"], ["light", "-S", str(pct)]])
+                if not _adjust_brightness("set", pct):
+                    self._send_json({"ok": False, "message": "Brightness control unavailable (backlight, ddcutil, or hyprsunset required)"}, HTTPStatus.NOT_IMPLEMENTED)
+                    return
             else:
                 self._send_json({"ok": False, "message": "Unsupported media action"}, HTTPStatus.BAD_REQUEST)
                 return
@@ -2994,7 +5133,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "message": f"BootNext set to {norm_num} ({name}). Rebooting..."})
                 return
 
-            if target in ("arch", "garuda", "gentoo", "ubuntu", "fedora", "debian", "windows"):
+            if target in ("arch", "cachyos", "garuda", "gentoo", "nixos", "ubuntu", "fedora", "debian", "windows"):
                 _, out, _ = run_cmd(["efibootmgr"])
                 found_num = None
                 for line in out.splitlines():
@@ -3048,7 +5187,26 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if target == "lock":
-                run_first_available([["hyprlock"], ["swaylock"], ["loginctl", "lock-session"]])
+                env = get_desktop_env()
+                comp = get_active_compositor(env)
+                lock_cmds = [
+                    ["hyprlock"],
+                    ["swaylock"],
+                    ["waylock"],
+                    ["gtklock"],
+                    ["i3lock"],
+                    ["loginctl", "lock-session"],
+                ]
+                if comp == "kde":
+                    lock_cmds = [
+                        ["qdbus6", "org.freedesktop.ScreenSaver", "/ScreenSaver", "Lock"],
+                        ["qdbus", "org.freedesktop.ScreenSaver", "/ScreenSaver", "Lock"],
+                        [
+                            "dbus-send", "--session", "--dest=org.freedesktop.ScreenSaver",
+                            "/ScreenSaver", "org.freedesktop.ScreenSaver.Lock",
+                        ],
+                    ] + lock_cmds
+                run_first_available(lock_cmds)
                 run_cmd(["loginctl", "lock-sessions"])
                 self._send_json({"ok": True, "message": "Screen locked!"})
                 return
@@ -3056,7 +5214,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             if target == "suspend":
                 threading.Thread(
                     target=_delayed_power,
-                    args=([["systemctl", "suspend"], ["loginctl", "suspend"]],),
+                    args=([["systemctl", "suspend"], ["loginctl", "suspend"], ["zzz"]],),
                     daemon=True,
                 ).start()
                 self._send_json({"ok": True, "message": "Suspending system..."})
@@ -3134,8 +5292,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 if preset not in LAUNCH_PRESETS:
                     self._send_json({"ok": False, "message": "Invalid application preset"}, HTTPStatus.BAD_REQUEST)
                     return
+                search_path = get_desktop_env()["PATH"]
                 for cmd in LAUNCH_PRESETS[preset]:
-                    if shutil.which(cmd[0]):
+                    if find_bin(cmd[0], search_path):
                         run_as_user(cmd, background=True)
                         self._send_json({"ok": True, "message": f"Launching preset: {preset}"})
                         return
@@ -3143,6 +5302,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if tp == "ws":
+                global _LAST_RIVER_TAG
                 try:
                     val_num = int(val)
                 except (TypeError, ValueError):
@@ -3151,19 +5311,47 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 if not (1 <= val_num <= 99):
                     self._send_json({"ok": False, "message": "Workspace must be between 1 and 99"}, HTTPStatus.BAD_REQUEST)
                     return
-                rc, _, err = run_first_available([
-                    ["hyprctl", "dispatch", f"hl.dsp.focus({{ workspace = {val_num} }})"],
-                    ["hyprctl", "dispatch", "workspace", str(val_num)],
-                    ["swaymsg", "workspace", str(val_num)],
-                    ["wmctrl", "-s", str(val_num - 1)],
-                    ["xdotool", "set_desktop", str(val_num - 1)],
-                ])
+                env = get_desktop_env()
+                comp = get_active_compositor(env)
+                ws_cmds_by_comp = {
+                    "hyprland": [
+                        ["hyprctl", "dispatch", f"hl.dsp.focus({{ workspace = {val_num} }})"],
+                        ["hyprctl", "dispatch", "workspace", str(val_num)],
+                    ],
+                    "niri": [["niri", "msg", "action", "focus-workspace", str(val_num)]],
+                    "sway": [["swaymsg", "workspace", str(val_num)]],
+                    "kde": [
+                        ["qdbus6", "org.kde.KWin", "/KWin", "org.kde.KWin.setCurrentDesktop", str(val_num)],
+                        ["qdbus", "org.kde.KWin", "/KWin", "org.kde.KWin.setCurrentDesktop", str(val_num)],
+                        [
+                            "dbus-send", "--session", "--dest=org.kde.KWin", "/KWin",
+                            "org.kde.KWin.setCurrentDesktop", f"int32:{val_num}",
+                        ],
+                        ["kdotool", "set_desktop", str(val_num)],
+                    ],
+                }
+                if val_num <= 32:
+                    ws_cmds_by_comp["river"] = [["riverctl", "set-focused-tags", str(1 << (val_num - 1))]]
+                x11_ws = [["wmctrl", "-s", str(val_num - 1)], ["xdotool", "set_desktop", str(val_num - 1)]]
+                if comp in ws_cmds_by_comp:
+                    ws_cmds = ws_cmds_by_comp[comp] + x11_ws
+                else:
+                    ws_cmds = (
+                        ws_cmds_by_comp["hyprland"]
+                        + ws_cmds_by_comp["niri"]
+                        + ws_cmds_by_comp["sway"]
+                        + ws_cmds_by_comp["kde"]
+                        + x11_ws
+                    )
+                rc, _, err = run_first_available(ws_cmds)
                 if rc != 0:
                     self._send_json(
                         {"ok": False, "message": err or f"Failed to switch to Workspace {val_num}"},
                         HTTPStatus.INTERNAL_SERVER_ERROR,
                     )
                     return
+                if comp == "river":
+                    _LAST_RIVER_TAG = val_num
                 self._send_json({"ok": True, "message": f"Switched to Workspace {val_num}"})
                 return
 
@@ -3172,7 +5360,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 if act not in HYPR_PRESETS:
                     self._send_json({"ok": False, "message": "Invalid window action"}, HTTPStatus.BAD_REQUEST)
                     return
-                rc, _, err = run_first_available(HYPR_PRESETS[act])
+                env = get_desktop_env()
+                rc, _, err = run_first_available(get_window_action_cmds(act, env))
                 if rc != 0:
                     self._send_json(
                         {"ok": False, "message": err or f"Window action failed: {act}"},
@@ -3182,13 +5371,30 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "message": f"Window action: {act}"})
                 return
 
-            if tp == "shell":
+            if tp in ("shell", "shell_gui", "shell_type"):
                 if os.environ.get("MRC_DISABLE_SHELL", "").strip().lower() in ("1", "true", "yes"):
                     self._send_json({"ok": False, "message": "Quick Web Terminal is disabled"}, HTTPStatus.FORBIDDEN)
                     return
                 cmd_str = str(val).strip()
                 if not cmd_str or len(cmd_str) > 2000:
                     self._send_json({"ok": False, "message": "Command must be 1-2000 characters"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if tp == "shell_gui":
+                    ok, detail = spawn_terminal_with_command(cmd_str)
+                    self._send_json({
+                        "ok": ok,
+                        "output": f"Opened on-screen terminal ({detail}) with: {cmd_str}" if ok else detail,
+                        "message": detail,
+                    })
+                    return
+                if tp == "shell_type":
+                    auto_enter = bool(data.get("auto_enter", True))
+                    ok, detail = type_prompt_to_active_window(cmd_str, auto_enter=auto_enter)
+                    self._send_json({
+                        "ok": ok,
+                        "output": f"Typed prompt into active window ({detail}, auto_enter={auto_enter})" if ok else detail,
+                        "message": detail,
+                    })
                     return
                 rc, out, err = run_as_user(cmd_str, timeout=15, shell=True)
                 combined = (out + ("\n" + err if err else "")).strip()
@@ -3213,6 +5419,72 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "message": "Invalid tunnel action"}, HTTPStatus.BAD_REQUEST)
             return
 
+        if path == "/api/mobile/revoke":
+            dev_id = str(data.get("id", "")).strip()
+            if not dev_id:
+                self._send_json({"ok": False, "message": "Missing device id"}, HTTPStatus.BAD_REQUEST)
+                return
+            ok = revoke_mobile_device(dev_id)
+            self._send_json({"ok": ok, "message": "Device revoked" if ok else "Device id not found"})
+            return
+
+        if path == "/api/feedback":
+            ip = self._client_ip()
+            now = time.time()
+            with _AUTH_LOCK:
+                if len(_FEEDBACK_HISTORY) > 1000:
+                    oldest_ip = min(_FEEDBACK_HISTORY, key=lambda k: (_FEEDBACK_HISTORY[k][-1] if _FEEDBACK_HISTORY[k] else 0))
+                    _FEEDBACK_HISTORY.pop(oldest_ip, None)
+                hist = [t for t in _FEEDBACK_HISTORY.get(ip, []) if (now - t) < 600]
+                if len(hist) >= 5:
+                    _FEEDBACK_HISTORY[ip] = hist
+                    self._send_json({"ok": False, "message": "Feedback rate limit reached. Try again later."}, HTTPStatus.TOO_MANY_REQUESTS)
+                    return
+
+            category = str(data.get("category", "other")).strip().lower()
+            if category not in ("suggestion", "bug", "other"):
+                category = "other"
+            subject = re.sub(r"[\r\n]+", " ", str(data.get("subject", ""))).strip()
+            message = str(data.get("message", "")).strip()
+            reply_to = re.sub(r"[\r\n]+", "", str(data.get("reply_to", ""))).strip()[:120]
+            if not (1 <= len(subject) <= 120):
+                self._send_json({"ok": False, "message": "Subject must be 1-120 characters"}, HTTPStatus.BAD_REQUEST)
+                return
+            if not (3 <= len(message) <= 4000):
+                self._send_json({"ok": False, "message": "Message must be 3-4000 characters"}, HTTPStatus.BAD_REQUEST)
+                return
+            if reply_to and ("@" not in reply_to or any(c.isspace() for c in reply_to)):
+                self._send_json({"ok": False, "message": "Invalid reply email address"}, HTTPStatus.BAD_REQUEST)
+                return
+            with _AUTH_LOCK:
+                hist = [t for t in _FEEDBACK_HISTORY.get(ip, []) if (now - t) < 600]
+                if len(hist) >= 5:
+                    _FEEDBACK_HISTORY[ip] = hist
+                    self._send_json({"ok": False, "message": "Feedback rate limit reached. Try again later."}, HTTPStatus.TOO_MANY_REQUESTS)
+                    return
+                hist.append(now)
+                _FEEDBACK_HISTORY[ip] = hist
+            include_sysinfo = bool(data.get("include_sysinfo", False))
+            res = send_feedback_report(category, subject, message, reply_to=reply_to, include_sysinfo=include_sysinfo)
+            self._send_json(res)
+            return
+
+        if path == "/api/services":
+            ok, msg = control_service(data.get("name", ""), data.get("action", ""))
+            status = HTTPStatus.OK if ok else (HTTPStatus.BAD_REQUEST if msg.startswith("Invalid") else HTTPStatus.OK)
+            self._send_json({"ok": ok, "message": msg}, status)
+            return
+
+        if path == "/api/process/kill":
+            ok, msg = kill_process(data.get("pid"), data.get("signal", "TERM"))
+            self._send_json({"ok": ok, "message": msg})
+            return
+
+        if path == "/api/input":
+            ok, msg = send_remote_input(data.get("kind", ""), data)
+            self._send_json({"ok": ok, "message": msg})
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND, "Endpoint not found")
 
 
@@ -3223,7 +5495,9 @@ def main():
     get_termux_token()
     get_ntfy_topic()
     get_cpu_percent()
+    record_audit_event("INFO", f"Mobile-RC server listening on 0.0.0.0:{PORT}")
     threading.Thread(target=_tunnel_watchdog, daemon=True).start()
+    threading.Thread(target=_discovery_worker, daemon=True).start()
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), ControlHandler)
     print(f"[Mobile-RC] Server running at http://0.0.0.0:{PORT}")
     try:

@@ -28,6 +28,22 @@ if command -v rc-service >/dev/null 2>&1; then
     rm -f /etc/init.d/mobile-rc
 fi
 
+if command -v dinitctl >/dev/null 2>&1; then
+    dinitctl stop mobile-rc 2>/dev/null || true
+    dinitctl disable mobile-rc 2>/dev/null || true
+    rm -f /etc/dinit.d/mobile-rc /etc/dinit.d/boot.d/mobile-rc
+fi
+
+if command -v sv >/dev/null 2>&1 || [ -d /etc/sv/mobile-rc ] || [ -d /etc/runit/sv/mobile-rc ]; then
+    for d in /var/service /run/runit/service /etc/service; do
+        if [ -L "${d}/mobile-rc" ] || [ -e "${d}/mobile-rc" ]; then
+            command -v sv >/dev/null 2>&1 && sv stop "${d}/mobile-rc" 2>/dev/null || true
+            rm -f "${d}/mobile-rc"
+        fi
+    done
+    rm -rf /etc/sv/mobile-rc /etc/runit/sv/mobile-rc
+fi
+
 pkill -f "/opt/mobile-rc/server.py" 2>/dev/null || true
 rm -rf /opt/mobile-rc /usr/local/bin/control-access /usr/local/bin/kontrol-laptop
 rm -rf /tmp/mrc_shot_* /tmp/mrc_raw.png /tmp/mrc_live_shot.jpg /var/log/mobile-rc.log

@@ -3,8 +3,8 @@ set -euo pipefail
 
 # ==========================================================
 # Mobile-RC - Universal Linux Remote Control Center
-# Supports: Arch, Ubuntu/Debian, Fedora, Gentoo, openSUSE, etc.
-# Init Systems: systemd & OpenRC
+# Supports: Arch, CachyOS, Gentoo, NixOS (flake), Void, Artix, etc.
+# Init Systems: systemd, OpenRC, dinit & runit
 # ==========================================================
 
 RED='\033[0;31m'
@@ -21,6 +21,14 @@ echo -e "${CYAN}====================================================${NC}"
 if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}Error: This installer must be run as root (use sudo).${NC}"
     exit 1
+fi
+
+if [ -e /etc/NIXOS ]; then
+    echo -e "${YELLOW}Detected NixOS (declarative immutable /etc).${NC}"
+    echo -e "Use the included Nix Flake / NixOS module instead of this FHS installer:"
+    echo -e "  services.mobile-rc.enable = true;"
+    echo -e "See flake.nix and README.md (NixOS section) in this repository."
+    exit 0
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -190,6 +198,51 @@ EOF
     rc-service mobile-rc restart 2>/dev/null || rc-service mobile-rc start
     echo -e "${GREEN}✓ mobile-rc service successfully enabled and started via OpenRC!${NC}"
 
+elif command -v dinitctl >/dev/null 2>&1 && [ -d /etc/dinit.d ] && dinitctl list >/dev/null 2>&1; then
+    echo -e "   -> Detected init system: ${CYAN}dinit${NC}"
+    ENV_BIN="$(command -v env || echo /usr/bin/env)"
+    cat << EOF > /etc/dinit.d/mobile-rc
+type = process
+command = ${ENV_BIN} MRC_USER=${TARGET_USER} ${PYTHON_BIN} /opt/mobile-rc/server.py
+restart = true
+smooth-recovery = true
+logfile = /var/log/mobile-rc.log
+EOF
+    chmod 644 /etc/dinit.d/mobile-rc
+    dinitctl enable mobile-rc 2>/dev/null || true
+    dinitctl restart mobile-rc 2>/dev/null || dinitctl start mobile-rc
+    echo -e "${GREEN}mobile-rc service successfully enabled and started via dinit!${NC}"
+
+elif command -v sv >/dev/null 2>&1 && { [ -d /var/service ] || [ -d /run/runit/service ] || [ -d /etc/service ]; }; then
+    echo -e "   -> Detected init system: ${CYAN}runit${NC}"
+    RUNIT_SV_BASE="/etc/sv"
+    if [ -d /etc/runit/sv ] && [ ! -d /etc/sv ]; then
+        RUNIT_SV_BASE="/etc/runit/sv"
+    fi
+    if [ -d /var/service ]; then
+        RUNIT_SVC_BASE="/var/service"
+    elif [ -d /run/runit/service ]; then
+        RUNIT_SVC_BASE="/run/runit/service"
+    else
+        RUNIT_SVC_BASE="/etc/service"
+    fi
+    mkdir -p "${RUNIT_SV_BASE}/mobile-rc"
+    rm -f "${RUNIT_SV_BASE}/mobile-rc/down"
+    cat << EOF > "${RUNIT_SV_BASE}/mobile-rc/run"
+#!/bin/sh
+exec 2>&1
+export MRC_USER="${TARGET_USER}"
+exec ${PYTHON_BIN} /opt/mobile-rc/server.py >>/var/log/mobile-rc.log
+EOF
+    chmod 755 "${RUNIT_SV_BASE}/mobile-rc/run"
+    ln -sfn "${RUNIT_SV_BASE}/mobile-rc" "${RUNIT_SVC_BASE}/mobile-rc"
+    for _ in 1 2 3 4 5 6 7 8; do
+        [ -d "${RUNIT_SVC_BASE}/mobile-rc/supervise" ] && break
+        sleep 0.5
+    done
+    sv restart "${RUNIT_SVC_BASE}/mobile-rc" >/dev/null 2>&1 || sv up "${RUNIT_SVC_BASE}/mobile-rc" >/dev/null 2>&1 || true
+    echo -e "${GREEN}mobile-rc service successfully enabled and started via runit!${NC}"
+
 else
     echo -e "${YELLOW}Warning: Unrecognized init system. Launching background process via nohup.${NC}"
     pkill -f "/opt/mobile-rc/server.py" 2>/dev/null || true
@@ -211,7 +264,7 @@ echo -e "  🔑 Generate code on PC     : ${YELLOW}sudo control-access${NC}"
 echo -e "  📱 Show Termux pairing cmd : ${YELLOW}sudo control-access --setup-termux${NC}"
 echo -e "  📧 Setup Online Email OTP  : ${YELLOW}sudo control-access --setup-email${NC}"
 echo ""
-echo -e "  Remote Internet Portal (Disabled by default; toggle in Files & Net tab):"
+echo -e "  Remote Internet Portal (Disabled by default; toggle in Net & Feed tab):"
 echo -e "  👉 ${CYAN}https://ntfy.sh/${NTFY_TOPIC}${NC}"
 echo -e "${GREEN}====================================================${NC}"
 if [ -x /usr/local/bin/control-access ]; then

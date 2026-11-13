@@ -1,6 +1,10 @@
 # Linux Mobile Control Center 
 
-A lightweight, zero-dependency Web Dashboard written in pure Python 3 to monitor hardware health, preview desktop screens, and control multi-boot Linux machines directly from your smartphone or web browser (locally or over the internet).
+> [!NOTE]
+> **Project Status: Under Active Development**
+> Core monitoring, screen preview, multi-boot switching, service control, and OTP authentication are live. Extended Desktop PC controls (DDC/CI external brightness, GPU sensors), System Logs, Installed Distros scanner, interactive Desktop Terminal Prompt injection, Feedback Reporting, and the native Flutter `.apk` client (`mobile-app/`) are currently under active development.
+
+A lightweight, zero-dependency Web Dashboard & Android companion suite written in pure Python 3 to monitor hardware health, inspect system logs and installed distros, preview desktop screens, and control multi-boot Linux Desktop PCs, Workstations, and Laptops directly from your smartphone (locally or over the internet).
 
 Universally engineered to work seamlessly across major Linux distributions and desktop environments / window managers.
 
@@ -14,12 +18,13 @@ Linux Mobile Control Center is designed to be universal across the entire Linux 
 
 | Distribution Family | Distros Tested / Supported | Init System | Support Status |
 | :--- | :--- | :--- | :---: |
-| **Arch Family** | Arch Linux, GarudaOS, EndeavourOS, Manjaro | `systemd` | ✅ Fully Supported |
-| **Gentoo / Source** | Gentoo Linux, Funtoo | `OpenRC` / `systemd` | ✅ Fully Supported |
-| **Debian / Ubuntu** | Ubuntu, Debian, Linux Mint, Pop!_OS, Zorin OS, Kali | `systemd` | ✅ Fully Supported |
-| **Fedora / RHEL** | Fedora Workstation/Silverblue, RHEL, AlmaLinux, Rocky | `systemd` | ✅ Fully Supported |
-| **openSUSE** | openSUSE Tumbleweed, openSUSE Leap | `systemd` | ✅ Fully Supported |
-| **Independent / Minimal**| Alpine Linux, Artix Linux, Void Linux | `OpenRC` / `systemd` / `runit` | ✅ Supported |
+| **Arch Family** | Arch Linux, CachyOS, GarudaOS, EndeavourOS, Manjaro | `systemd` | Supported |
+| **Gentoo / Source** | Gentoo Linux, Funtoo | `OpenRC` / `systemd` | Supported |
+| **NixOS (Non-FHS)** | NixOS (`flake.nix` & `services.mobile-rc`) | `systemd` (Declarative) | Supported |
+| **Debian / Ubuntu** | Ubuntu, Debian, Linux Mint, Pop!_OS, Zorin OS, Kali | `systemd` | Supported |
+| **Fedora / RHEL** | Fedora Workstation/Silverblue, RHEL, AlmaLinux, Rocky | `systemd` | Supported |
+| **openSUSE** | openSUSE Tumbleweed, openSUSE Leap | `systemd` | Supported |
+| **Independent / Minimal**| Alpine Linux, Artix Linux, Chimera Linux, Void Linux | `OpenRC` / `dinit` / `runit` / `systemd` | Supported |
 
 ---
 
@@ -30,30 +35,33 @@ Linux Mobile Control Center intelligently adapts its screen capture, clipboard s
 #### 1. Wayland Compositors
 | Environment | Screen Capture Tool | Window & Workspace Control | Clipboard Tool |
 | :--- | :--- | :--- | :--- |
-| **Hyprland** | `grim` (PIL / ImageMagick compression) | `hyprctl` (`0.57.1+` Lua `hl.dsp.*` and classic syntax) | `wl-copy` |
-| **KDE Plasma 6 / 5 (Wayland)** | `spectacle` (background CLI mode) | `hyprctl` / `swaymsg` / `wmctrl` / `xdotool` (XWayland) | `wl-copy` |
-| **Sway / Wayfire / River** | `grim` | `swaymsg` / `wlopm` | `wl-copy` |
+| **Hyprland** | `grim` / `wayshot` | `hyprctl` (`0.57.1+` Lua `hl.dsp.*` & classic syntax) | `wl-copy` |
+| **Niri** | `grim` / `wayshot` | `niri msg` (`workspaces`, `focus-workspace`, `fullscreen-window`, `close-window`, `power-off-monitors`) | `wl-copy` |
+| **KDE Plasma 6 / 5 (Wayland)** | `spectacle` | `qdbus6` / `qdbus` / `dbus-send` / `kdotool` (KWin desktops, Fullscreen, Close Window, PowerDevil DPMS) | `wl-copy` |
+| **River** | `grim` / `wayshot` | `riverctl` (tags 1-9, `toggle-fullscreen`, `close`), `wlopm` | `wl-copy` |
+| **Sway / Wayfire / Labwc** | `grim` / `wayshot` | `swaymsg`, `wlopm` | `wl-copy` |
 | **GNOME (Wayland)** | `gnome-screenshot` / `spectacle` | `loginctl` | `wl-copy` |
 
 #### 2. X11 Window Managers & Desktop Environments
 | Environment | Screen Capture Tool | Window & Workspace Control | Clipboard Tool |
 | :--- | :--- | :--- | :--- |
-| **Tiling WMs** (`i3`, `bspwm`, `awesome`, `dwm`, `xmonad`) | `maim` / `scrot` / `import` | `wmctrl` / `xdotool` / `xset` | `xclip` / `xsel` |
+| **Tiling WMs** (`i3`, `bspwm`, `awesome`, `dwm`, `xmonad`) | `maim` / `scrot` / `import` | `wmctrl` (`-d`, `-s`, `-r :ACTIVE: -b toggle,fullscreen`, `-c :ACTIVE:`) / `xdotool` / `xset` | `xclip` / `xsel` |
 | **Traditional Desktops** (`XFCE`, `MATE`, `LXQt`, `Cinnamon`) | `maim` / `scrot` / `import` / `spectacle` | `wmctrl` / `xdotool` | `xclip` / `xsel` |
-| **KDE Plasma (X11)** / **GNOME (X11)** | `spectacle` / `gnome-screenshot` / `import` | `wmctrl` / `xdotool` / `loginctl` | `xclip` / `xsel` |
+| **KDE Plasma (X11)** / **GNOME (X11)** | `spectacle` / `gnome-screenshot` / `import` | `qdbus6` / `wmctrl` / `xdotool` / `loginctl` | `xclip` / `xsel` |
 
 ---
 
 ##  Features
 
-- **Real-time System Monitor:** Live telemetry of CPU load, CPU temperatures, RAM usage, battery status, and disk partitions (NVMe, SATA, LVM/LUKS).
-- **Silent Live Screen Preview & Dynamic Workspaces:** Auto-refreshing desktop preview (`Live ON / PAUSED` toggle) without switching windows or tabs on the laptop, paired with dynamic workspace buttons matching active PC workspaces (wrapping below after 4 columns) plus Fullscreen, Screen On/Off (DPMS), and Close App controls supporting Hyprland `0.57.1+` Lua API (`hl.dsp.*`), classic Hyprland, Sway, `wlopm`, `wmctrl`, `xdotool`, and `xset`.
-- **Multi-Boot OS Switcher:** One-click instant reboot to any installed OS using UEFI NVRAM (`efibootmgr -n`), reboot into BIOS/UEFI firmware, lock screen, reboot, or shut down.
-- **Media, Volume & Brightness Remote:** Control system volume (slider, +/-5%, mute), screen brightness backlight (`brightnessctl` / `light`), and media playback (Play/Pause/Next/Prev) via `playerctl`, `wpctl`, and `pactl`.
-- **Bi-directional File Sharing:** Upload files from smartphone to PC `~/Downloads` and download PC files with filename sanitization.
-- **Remote Input & Web Terminal:** Send desktop notifications (`notify-send` / `hyprctl notify`), paste text into Wayland/X11 clipboards, open HTTP/HTTPS URLs on the PC browser, launch preset apps, and run remote terminal commands (`MRC_DISABLE_SHELL=1` to disable).
-- **On-Demand Random Code & Online Email OTP:** Random single-use 6-digit codes generated on demand via Termux (`control-access`) or PC (`sudo control-access`), backed by brute-force lockout, `HttpOnly` sessions, Origin checks, and CSRF tokens. When accessed remotely via a tunnel or non-local host, the login screen automatically offers one-time **Email OTP** delivery over SMTP (`STARTTLS` / `SMTP_SSL`, e.g. Gmail + App Password) restricted to whitelisted recipient emails.
-- **Zero External Python Dependencies:** Built entirely on the Python 3 Standard Library.
+- **Real-time System Monitor (Desktop PC & Laptop Ready):** Live telemetry of CPU load, CPU/GPU temperatures, RAM & Swap usage, NIC RX/TX throughput & MAC addresses (for Wake-on-LAN), adaptive Power/GPU status (plus Battery/UPS when present), and disk partitions (NVMe, SATA, Btrfs, LVM/LUKS).
+- **Silent Live Screen Preview & Dynamic Workspaces:** Auto-refreshing desktop preview (`Live ON / PAUSED` toggle) without switching windows or tabs on the PC / laptop, paired with dynamic workspace buttons matching active PC workspaces (wrapping below after 4 columns) plus Fullscreen, Screen On/Off (DPMS), and Close App controls supporting Hyprland `0.57.1+` Lua API (`hl.dsp.*`), Niri (`niri msg`), KDE Plasma 6 (`qdbus6` / `kdotool` / `kscreen-doctor`), River (`riverctl`), Sway, `wlopm`, `wmctrl`, `xdotool`, and `xset`.
+- **Installed Distros & Multi-Boot OS Switcher:** Combines live OS/init/compositor metadata, `efibootmgr`, `systemd-boot`, `GRUB` entries, mounted Btrfs subvolumes, `os-prober`, and an optional read-only unmounted partition scan (`?deep=1`), paired with one-click UEFI `BootNext`, firmware setup, lock screen, suspend, reboot, and shutdown.
+- **System Logs Viewer:** Inspect `journalctl` (`systemd`), `/var/log/messages` / `syslog` / `rc.log` / `socklog` (`OpenRC` / `dinit` / `runit`), `dmesg`, and `mobile-rc` daemon logs with source and keyword filters.
+- **Media, Volume & Display Brightness (Internal + External Monitors):** Control system volume (slider, +/-5%, mute), laptop backlight (`brightnessctl` / `light`) or external desktop monitor brightness via DDC/CI (`ddcutil`), and media playback via `playerctl`, `wpctl`, and `pactl`.
+- **Bi-directional File Sharing & Built-in Feedback Inbox:** Upload/download files (`~/Downloads`) and submit suggestions or bug reports from the rightmost dashboard tab (hybrid delivery to maintainer inbox via local SMTP, optional `MRC_FEEDBACK_WEBHOOK`, or `mailto:` / GitHub fallback).
+- **Interactive Prompt & Remote Input:** Send desktop notifications, sync clipboard, open URLs, launch presets, control mouse/keyboard input (`ydotool` / `wtype` / `xdotool`), and run terminal prompts either quietly (`Run Silent`), visibly in a desktop terminal window (`Open on Screen`), or typed directly into the focused PC window (`Type to Active` with optional `Auto-Enter`).
+- **On-Demand Random Code, Bearer Device Tokens & Email OTP:** Single-use 6-digit codes (`control-access`), persistent hashed Bearer tokens for the native Flutter `.apk`, and remote SMTP Email OTP restricted to whitelisted emails.
+- **Zero External Python Dependencies:** Host daemon uses strictly the Python 3 Standard Library.
 
 ---
 
@@ -61,12 +69,15 @@ Linux Mobile Control Center intelligently adapts its screen capture, clipboard s
 
 ```text
 linux-mobile-remote-control/
+├── nix/
+│   └── module.nix        # Declarative NixOS module (`services.mobile-rc`)
+├── flake.nix             # NixOS / Nix Flake package & module definition
 ├── bin/
-│   └── control-access    # Host CLI: random codes, Termux setup & Email OTP wizard
+│   └── control-access    # Host CLI: random codes, Termux setup, --pair-info & Email OTP
 ├── termux/
 │   └── control-access    # Termux client CLI for smartphone pairing & quick login
-├── server.py             # Core HTTP API server & web dashboard UI (Pure Python 3)
-├── install.sh            # Universal system installer (auto-detects systemd & OpenRC)
+├── server.py             # Core HTTP API server, UDP discovery & web dashboard UI (Pure Python 3)
+├── install.sh            # Universal installer (systemd, OpenRC, dinit & runit)
 ├── update.sh             # Safe updater script (preserves tokens, config & SSH keys)
 ├── uninstall.sh          # Clean uninstaller script
 ├── .gitignore            # Git exclusion rules
@@ -79,14 +90,16 @@ linux-mobile-remote-control/
 ##  Requirements
 
 - **Python 3.8+** (Standard Library only)
-- **Screenshot capture (any of):** `grim` (Wayland), `spectacle`, `gnome-screenshot`, `maim`, `scrot`, or `import` (`magick` / `convert` / Pillow optional for JPEG resizing)
-- **Window / Workspace control (depending on DE/WM):** `hyprctl`, `swaymsg`, `wlopm`, `wmctrl`, `xdotool`, or `xset`
+- **Screenshot capture (any of):** `grim` / `wayshot` (Wayland), `spectacle`, `gnome-screenshot`, `maim`, `scrot`, or `import` (`magick` / `convert` / Pillow optional for JPEG resizing)
+- **Window / Workspace control (depending on DE/WM):** `hyprctl`, `niri`, `qdbus6`/`qdbus`/`kdotool`, `riverctl`, `swaymsg`, `wlopm`, `wmctrl`, `xdotool`, or `xset`
 - **Audio, Backlight & Media:** `wpctl` / `pactl`, `playerctl`, `brightnessctl` / `light`
 - **Multi-boot & Tunnel (optional):** `efibootmgr`, `ssh` (for opt-in `localhost.run` reverse tunnel)
 
 ---
 
 ##  Installation
+
+### Standard Linux (Arch / CachyOS / Gentoo / Void / Artix / Debian / Fedora)
 
 1. Clone this repository to your Linux machine:
    ```bash
@@ -100,7 +113,44 @@ linux-mobile-remote-control/
    sudo ./install.sh
    ```
 
-3. The installer will automatically detect your init system (**systemd** or **OpenRC**), register the background service, and launch the dashboard on port `8000`.
+3. The installer will automatically detect your init system (**systemd**, **OpenRC**, **dinit**, or **runit**), register the background service, and launch the dashboard on port `8000`.
+
+### NixOS (Declarative Flake Module)
+
+Because NixOS uses an immutable non-FHS layout, add this repository as a flake input and enable the included NixOS module (`services.mobile-rc`):
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    mobile-rc.url = "github:739202873/linux-mobile-remote-control";
+  };
+
+  outputs = { nixpkgs, mobile-rc, ... }: {
+    nixosConfigurations.your-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        mobile-rc.nixosModules.default
+        {
+          services.mobile-rc = {
+            enable = true;
+            openFirewall = true; # opens TCP port 8000 on LAN
+            # user = "youruser"; # optional override for MRC_USER
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Then rebuild and switch:
+```bash
+sudo nixos-rebuild switch --flake .#your-host
+sudo control-access
+```
 
 ---
 
@@ -109,26 +159,24 @@ linux-mobile-remote-control/
 ### 1. Local Network (Same Wi-Fi / Hotspot)
 Open your smartphone browser and navigate to:
 ```text
-http://<LAPTOP_IP>:8000
+http://<HOST_IP>:8000
 ```
 *(Example: `http://192.168.1.15:8000` or `http://10.11.5.233:8000`)*
 
-### 2. Termux Pairing & Random One-Time Codes
-Mobile-RC uses **on-demand random codes** by default (codes expire in 180s and are invalidated immediately after one login):
-1. On your PC, print the one-line Termux setup command:
+### 2. Termux CLI & Random One-Time Codes (RAC)
+Mobile-RC uses **on-demand random 6-digit codes (RAC)** by default (codes expire in 180s, are invalidated immediately after one login, and **no secret token is stored on your smartphone**):
+1. On your PC/Laptop, print the one-line Termux setup command:
    ```bash
    sudo control-access --setup-termux
    ```
-2. Paste that command once into **Termux** on your smartphone.
-3. Whenever you want to log in from your phone, run in Termux:
-   ```bash
-   control-access          # generate code
-   control-access --open   # generate code & open dashboard URL
-   ```
-   Useful Termux subcommands: `control-access status` (list saved URLs), `control-access add-url <URL>`, or `control-access <URL>`. On the PC directly, run `sudo control-access`. To use a fixed PIN instead, set `"pin_mode": "static"` in `/opt/mobile-rc/config.json` or `MRC_PIN` env var.
+2. Paste that command once into **Termux** on your smartphone to install the token-free `control-access` helper.
+3. Whenever you want to log in from your phone, run `control-access` in Termux (or open the web URL directly):
+   - **Same Network (Local LAN)**: Run `sudo control-access` on your PC/Laptop to display a 6-digit RAC, enter that 6-digit RAC in Termux (`control-access` or `control-access <6-DIGIT-RAC>`) or in the web login box, and it **automatically logs in and opens the dashboard**.
+   - **Different Network (Non-Local / Online)**: `control-access` in Termux (or the web login screen) prompts for your registered email address, sends a 6-digit RAC to your email inbox, and **automatically logs in and opens the dashboard** once you enter that code.
+   - Useful Termux subcommands: `control-access status` (list saved URLs and email), `control-access add-url <URL>`, or `control-access <URL>`. To use a fixed PIN on local LAN instead, set `"pin_mode": "static"` in `/opt/mobile-rc/config.json` or `MRC_PIN` env var.
 
 ### 3. Over the Internet (Opt-In Tunnel / Online Email OTP)
-For security, the internet tunnel is **disabled by default**. When you explicitly start it from the **Files & Net** tab (or set `MRC_AUTO_TUNNEL=1` / `"auto_tunnel": true` in `/opt/mobile-rc/config.json`), `server.py` opens an HTTPS tunnel (`localhost.run`) and publishes the active link to the private random notification portal generated during installation:
+For security, the internet tunnel is **disabled by default**. When you explicitly start it from the rightmost **Net & Feed** tab (or set `MRC_AUTO_TUNNEL=1` / `"auto_tunnel": true` in `/opt/mobile-rc/config.json`), `server.py` opens an HTTPS tunnel (`localhost.run`) and publishes the active link to the private random notification portal generated during installation:
 ```text
 https://ntfy.sh/<your-generated-topic>
 ```
@@ -159,14 +207,17 @@ Runtime configuration and secrets are stored outside the repository in `/opt/mob
 | `MRC_DISABLE_SHELL` | `0` | Set to `1` to disable Quick Web Terminal execution |
 | `MRC_AUTO_TUNNEL` | `0` | Set to `1` to start the remote SSH tunnel on boot |
 | `MRC_MAX_UPLOAD_MB` | `500` | Max file upload size in MiB |
-| `MRC_EMAIL_COOLDOWN` | `30` | Minimum seconds between Email OTP requests per IP (min `10`) |
-| `MRC_EMAIL_HOURLY_MAX` | `12` | Max Email OTP messages sent per hour (min `3`) |
+| `MRC_EMAIL_COOLDOWN` | `30` | Minimum seconds between Email OTP / feedback requests per IP (min `10`) |
+| `MRC_EMAIL_HOURLY_MAX` | `12` | Max Email OTP / feedback emails sent per hour (min `3`) |
+| `MRC_FEEDBACK_EMAIL` | `brypra4@gmail.com` | Destination inbox for Feedback & Bug Report form when using local SMTP |
+| `MRC_FEEDBACK_WEBHOOK` | *(unset)* | Optional HTTPS webhook URL (e.g. Web3Forms/Formspree) for zero-SMTP feedback relay |
+| `MRC_DISCOVERY` | `1` | Set to `0` to disable background LAN UDP auto-discovery listener |
 
 ---
 
 ##  Service & Boot Auto-Start Control
 
-Manage the background service and boot auto-start (supports OpenRC and systemd) directly with `control-access`:
+Manage the background service and boot auto-start (supports systemd, OpenRC, dinit, and runit) directly with `control-access`:
 
 ```bash
 control-access --status              # check running state & boot auto-start

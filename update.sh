@@ -67,6 +67,24 @@ restart_service() {
             sleep 1
             rc-service mobile-rc status >/dev/null 2>&1
             ;;
+        dinit)
+            dinitctl restart mobile-rc
+            sleep 1
+            dinitctl status mobile-rc 2>/dev/null | grep -qiE "started|running"
+            ;;
+        runit)
+            local svc_link=""
+            for d in /var/service /run/runit/service /etc/service; do
+                if [ -e "${d}/mobile-rc" ]; then
+                    svc_link="${d}/mobile-rc"
+                    break
+                fi
+            done
+            [ -n "${svc_link}" ] || return 1
+            sv restart "${svc_link}"
+            sleep 1
+            sv status "${svc_link}" 2>/dev/null | grep -q "^run:"
+            ;;
         nohup)
             pkill -f "${install_dir}/server.py" 2>/dev/null || true
             sleep 1
@@ -97,6 +115,12 @@ main() {
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     install_dir="/opt/mobile-rc"
     server_src="${script_dir}/server.py"
+
+    if [ -e /etc/NIXOS ] && [ ! -f "${install_dir}/server.py" ]; then
+        echo -e "${YELLOW}Detected declarative NixOS installation.${NC}"
+        echo -e "Update with: nix flake update && sudo nixos-rebuild switch"
+        exit 0
+    fi
 
     if [ ! -d "${install_dir}" ] || [ ! -f "${install_dir}/server.py" ]; then
         echo -e "${YELLOW}Mobile-RC is not installed in ${install_dir} yet.${NC}"
@@ -254,6 +278,10 @@ PYEOF
         fi
     elif command -v rc-service >/dev/null 2>&1 && [ -f /etc/init.d/mobile-rc ]; then
         svc_mode="openrc"
+    elif command -v dinitctl >/dev/null 2>&1 && [ -f /etc/dinit.d/mobile-rc ]; then
+        svc_mode="dinit"
+    elif command -v sv >/dev/null 2>&1 && { [ -e /var/service/mobile-rc ] || [ -e /run/runit/service/mobile-rc ] || [ -e /etc/service/mobile-rc ]; }; then
+        svc_mode="runit"
     fi
 
     if ! restart_service "${python_bin}" "${install_dir}" "${target_user}" "${svc_mode}"; then
