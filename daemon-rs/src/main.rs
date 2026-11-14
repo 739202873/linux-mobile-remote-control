@@ -19,8 +19,8 @@ use crate::auth::{
     verify_mobile_device_token, AuthState, SessionRecord,
 };
 use crate::config::{
-    ct_eq_str, is_allowed_email, is_root_or_admin, normalize_email, random_6digit_code, unix_secs,
-    ConfigStore, Settings,
+    ct_eq_str, is_allowed_email, normalize_email, random_6digit_code, unix_secs, ConfigStore,
+    Settings,
 };
 use crate::telemetry::{
     find_bin, get_active_compositor, get_desktop_env, get_hostname, run_as_user, run_cmd,
@@ -1042,9 +1042,11 @@ async fn handle_upload(
     }
 
     #[cfg(unix)]
-    if is_root_or_admin() && user_uid != 0 {
+    if crate::config::is_root_or_admin() && user_uid != 0 {
         crate::config::chown_path(&dest, user_uid, user_gid);
     }
+    #[cfg(not(unix))]
+    let _ = (user_uid, user_gid);
 
     json_ok(json!({
         "ok": true,

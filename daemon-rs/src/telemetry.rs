@@ -1,6 +1,8 @@
 //! Cross-platform system telemetry, command execution helpers, logs, services, and OS inventory.
 
-use crate::config::{is_root_or_admin, local_datetime_string, ConfigStore, TargetUserInfo};
+#[cfg(unix)]
+use crate::config::is_root_or_admin;
+use crate::config::{local_datetime_string, ConfigStore, TargetUserInfo};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -189,7 +191,7 @@ pub fn exec_cmd_blocking(
     }
 
     #[cfg(windows)]
-    cmd.creationflags(CREATE_NO_WINDOW);
+    cmd.creation_flags(CREATE_NO_WINDOW);
 
     #[cfg(unix)]
     {
@@ -416,6 +418,7 @@ fn compute_desktop_env(user: &TargetUserInfo) -> HashMap<String, String> {
         return env;
     }
 
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut session_path = String::new();
     let mut env = HashMap::new();
     env.insert("HOME".into(), user.home.clone());
@@ -1232,21 +1235,26 @@ impl TelemetryState {
 
     pub fn get_os_info(&self, cfg: &ConfigStore) -> Value {
         let mut base = cfg.cached("os_static", 3600.0, false, compute_os_static);
-        let mut uptime_str = "-".to_string();
         #[cfg(windows)]
-        unsafe {
+        let uptime_str = unsafe {
             let sec = win_ffi::GetTickCount64() / 1000;
             let (h, m) = (sec / 3600, (sec % 3600) / 60);
-            uptime_str = if h > 0 { format!("{h}h {m}m") } else { format!("{m}m") };
-        }
+            if h > 0 { format!("{h}h {m}m") } else { format!("{m}m") }
+        };
         #[cfg(not(windows))]
-        if let Ok(raw) = fs::read_to_string("/proc/uptime") {
-            if let Some(sec_f) = raw.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()) {
+        let uptime_str = fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|raw| {
+                raw.split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<f64>().ok())
+            })
+            .map(|sec_f| {
                 let sec = sec_f as u64;
                 let (h, m) = (sec / 3600, (sec % 3600) / 60);
-                uptime_str = if h > 0 { format!("{h}h {m}m") } else { format!("{m}m") };
-            }
-        }
+                if h > 0 { format!("{h}h {m}m") } else { format!("{m}m") }
+            })
+            .unwrap_or_else(|| "-".to_string());
         if let Some(obj) = base.as_object_mut() {
             obj.insert("uptime".into(), Value::String(uptime_str));
         }

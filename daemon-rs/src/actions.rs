@@ -10,7 +10,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -129,7 +128,7 @@ impl TunnelManager {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             #[cfg(windows)]
-            cmd.creationflags(CREATE_NO_WINDOW);
+            cmd.creation_flags(CREATE_NO_WINDOW);
 
             match cmd.spawn() {
                 Ok(mut child) => {
@@ -1073,11 +1072,11 @@ pub fn spawn_terminal_with_command(cfg: &ConfigStore, cmd_str: &str) -> (bool, S
 }
 
 pub fn capture_desktop_screenshot(cfg: &ConfigStore) -> Option<(Vec<u8>, &'static str)> {
-    let user = cfg.get_target_user_info();
     let tmpdir = std::env::temp_dir().join(format!("mrc_shot_{}", random_hex(6)));
     fs::create_dir_all(&tmpdir).ok()?;
     #[cfg(unix)]
     {
+        let user = cfg.get_target_user_info();
         if crate::config::is_root_or_admin() && user.uid != 0 {
             crate::config::chown_path(&tmpdir, user.uid, user.gid);
         }
@@ -1468,9 +1467,9 @@ pub fn spawn_windows_launch(exe: &str, args: &[&str], new_console: bool) -> bool
         .stderr(Stdio::null());
     #[cfg(windows)]
     if new_console {
-        cmd.creationflags(0x0000_0010); // CREATE_NEW_CONSOLE
+        cmd.creation_flags(0x0000_0010); // CREATE_NEW_CONSOLE
     } else {
-        cmd.creationflags(CREATE_NO_WINDOW);
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let _ = new_console;
     match cmd.spawn() {
@@ -1490,8 +1489,7 @@ pub fn win_open_url(url: &str) -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn win_open_url(url: &str) -> bool {
-    let _ = Path::new(url);
+pub fn win_open_url(_url: &str) -> bool {
     false
 }
 

@@ -810,6 +810,8 @@ pub fn write_secure_file(path: &Path, content: &[u8], mode: u32) -> std::io::Res
     f.sync_all()?;
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    #[cfg(not(unix))]
+    let _ = mode;
     Ok(())
 }
 
