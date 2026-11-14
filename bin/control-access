@@ -15,6 +15,8 @@ Usage:
 """
 
 import argparse
+import csv
+import ctypes
 from email.message import EmailMessage
 import getpass
 import json
@@ -24,6 +26,7 @@ import re
 import shlex
 import shutil
 import smtplib
+import socket
 import ssl
 import subprocess
 import sys
@@ -32,10 +35,37 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+IS_WINDOWS = os.name == "nt"
+
+
+def _is_privileged():
+    if IS_WINDOWS:
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return True
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
 def _default_config_dir():
     env_dir = os.environ.get("MRC_CONFIG_DIR", "").strip()
     if env_dir:
         return env_dir
+    if IS_WINDOWS:
+        prog_data = os.environ.get("ProgramData") or os.path.join(
+            os.environ.get("SystemDrive", "C:") + os.sep, "ProgramData"
+        )
+        pd_dir = os.path.join(prog_data, "Mobile-RC")
+        local_dir = os.path.join(
+            os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Mobile-RC"
+        )
+        if os.path.exists(os.path.join(pd_dir, "config.json")) or (
+            os.path.isdir(pd_dir) and os.access(pd_dir, os.R_OK)
+        ):
+            return pd_dir
+        if os.path.exists(os.path.join(local_dir, "config.json")):
+            return local_dir
+        return pd_dir if _is_privileged() else local_dir
     if os.path.exists("/etc/NIXOS") or (
         os.path.isdir("/var/lib/mobile-rc") and not os.path.exists("/opt/mobile-rc/config.json")
     ):
@@ -44,6 +74,15 @@ def _default_config_dir():
 
 
 def _find_bin(name):
+    if IS_WINDOWS:
+        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+        extra = os.pathsep.join([
+            os.environ.get("PATH", ""),
+            os.path.join(sys_root, "System32"),
+            sys_root,
+            os.path.join(sys_root, "System32", "WindowsPowerShell", "v1.0"),
+        ])
+        return shutil.which(name, path=extra)
     extra = (
         f"{os.environ.get('PATH', '')}:"
         "/run/wrappers/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:"
@@ -66,7 +105,15 @@ NC = "\033[0m"
 
 def get_lan_ips():
     ips = []
-    if shutil.which("ip"):
+    if IS_WINDOWS:
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = info[4][0]
+                if ip and not ip.startswith("127.") and ip not in ips:
+                    ips.append(ip)
+        except Exception:
+            pass
+    elif shutil.which("ip"):
         res = subprocess.run(
             ["ip", "-4", "-o", "addr", "show", "scope", "global"],
             capture_output=True,
@@ -82,11 +129,32 @@ def get_lan_ips():
                         ip = parts[idx].split("/", 1)[0]
                         if ip and not ip.startswith("127.") and ip not in ips:
                             ips.append(ip)
+    if not ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+            s.close()
+        except Exception:
+            pass
     return ips
 
 
 def get_mac_addresses():
     macs = []
+    if IS_WINDOWS:
+        res = subprocess.run(["getmac", "/FO", "CSV", "/NH"], capture_output=True, text=True, check=False)
+        if res.returncode == 0 and res.stdout:
+            for idx, row in enumerate(csv.reader(res.stdout.splitlines())):
+                if not row:
+                    continue
+                cand = row[0].strip().replace("-", ":").lower()
+                if re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", cand) and cand != "00:00:00:00:00:00":
+                    iface = row[1].strip() if len(row) > 1 and row[1].strip() else f"nic{idx}"
+                    macs.append({"iface": iface, "mac": cand})
+        return macs
     net_dir = "/sys/class/net"
     if os.path.isdir(net_dir):
         for iface in sorted(os.listdir(net_dir)):
@@ -105,11 +173,13 @@ def get_mac_addresses():
 
 
 def load_config():
-    if os.geteuid() != 0 and not os.access(CONFIG_FILE, os.R_OK):
-        print(f"{RED}Permission denied reading {CONFIG_FILE}. Run with: sudo control-access{NC}", file=sys.stderr)
+    if not _is_privileged() and not os.access(CONFIG_FILE, os.R_OK):
+        hint = "Run from an Administrator terminal" if IS_WINDOWS else "Run with: sudo control-access"
+        print(f"{RED}Permission denied reading {CONFIG_FILE}. {hint}{NC}", file=sys.stderr)
         sys.exit(1)
     if not os.path.exists(CONFIG_FILE):
-        print(f"{RED}Config not found at {CONFIG_FILE}. Run sudo ./install.sh first.{NC}", file=sys.stderr)
+        hint = "Run install.ps1 first." if IS_WINDOWS else "Run sudo ./install.sh first."
+        print(f"{RED}Config not found at {CONFIG_FILE}. {hint}{NC}", file=sys.stderr)
         sys.exit(1)
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -244,14 +314,20 @@ def _norm_email(val):
 
 
 def save_config(cfg):
-    cfg_dir = os.path.dirname(CONFIG_FILE) or "/opt/mobile-rc"
+    cfg_dir = os.path.dirname(CONFIG_FILE) or _default_config_dir()
     os.makedirs(cfg_dir, mode=0o700, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=".cfg_", dir=cfg_dir)
     try:
-        os.chmod(tmp_path, 0o600)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
-        os.chmod(tmp_path, 0o600)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
         os.replace(tmp_path, CONFIG_FILE)
     finally:
         if os.path.exists(tmp_path):
@@ -305,8 +381,9 @@ def send_test_email(cfg, recipient=None):
 
 
 def setup_email(cfg):
-    if os.geteuid() != 0 and not os.access(CONFIG_FILE, os.W_OK):
-        print(f"{RED}Permission denied writing {CONFIG_FILE}. Run with: sudo control-access --setup-email{NC}", file=sys.stderr)
+    if not _is_privileged() and not os.access(CONFIG_FILE, os.W_OK):
+        hint = "Run from an Administrator terminal" if IS_WINDOWS else "Run with: sudo control-access --setup-email"
+        print(f"{RED}Permission denied writing {CONFIG_FILE}. {hint}{NC}", file=sys.stderr)
         sys.exit(1)
 
     cur = cfg.get("email_otp") if isinstance(cfg.get("email_otp"), dict) else {}
@@ -391,6 +468,8 @@ def _runit_paths():
 
 
 def _detect_init_mode():
+    if IS_WINDOWS:
+        return "schtasks"
     if _find_bin("systemctl") and os.path.isdir("/run/systemd/system") and (
         os.path.exists("/etc/systemd/system/mobile-rc.service")
         or os.path.exists("/etc/static/systemd/system/mobile-rc.service")
@@ -408,6 +487,19 @@ def _detect_init_mode():
 def _service_state(mode):
     running = False
     autostart = "unsupported"
+    if mode == "schtasks":
+        res = subprocess.run(["schtasks", "/Query", "/TN", "Mobile-RC", "/FO", "LIST"], capture_output=True, text=True, check=False)
+        if res.returncode == 0 and res.stdout:
+            out_l = res.stdout.lower()
+            running = "running" in out_l
+            autostart = "disabled" if "disabled" in out_l else "enabled"
+        if not running:
+            try:
+                with socket.create_connection(("127.0.0.1", DEFAULT_PORT), timeout=0.6):
+                    running = True
+            except OSError:
+                pass
+        return running, autostart
     if mode == "systemd":
         running = subprocess.run(["systemctl", "is-active", "--quiet", "mobile-rc.service"], check=False).returncode == 0
         en_rc = subprocess.run(["systemctl", "is-enabled", "--quiet", "mobile-rc.service"], check=False).returncode
@@ -436,7 +528,10 @@ def _service_state(mode):
             autostart = "disabled"
     else:
         if _find_bin("pgrep"):
-            running = subprocess.run(["pgrep", "-f", "/opt/mobile-rc/server.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
+            running = (
+                subprocess.run(["pgrep", "-f", "/opt/mobile-rc/server.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
+                or subprocess.run(["pgrep", "-f", "/opt/mobile-rc/mobile-rc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
+            )
     return running, autostart
 
 
@@ -454,15 +549,25 @@ def print_service_status():
 
 
 def _require_root_for_service(flag_name):
-    if os.geteuid() != 0:
-        print(f"{RED}Root permission required. Run with: sudo control-access {flag_name}{NC}", file=sys.stderr)
+    if not _is_privileged():
+        if IS_WINDOWS:
+            print(f"{RED}Administrator privileges required. Run terminal as Administrator: control-access {flag_name}{NC}", file=sys.stderr)
+        else:
+            print(f"{RED}Root permission required. Run with: sudo control-access {flag_name}{NC}", file=sys.stderr)
         sys.exit(1)
 
 
 def manage_boot_autostart(enable):
     _require_root_for_service("--enable" if enable else "--disable")
     mode = _detect_init_mode()
-    if mode == "systemd":
+    if mode == "schtasks":
+        res = subprocess.run(
+            ["schtasks", "/Change", "/TN", "Mobile-RC", "/ENABLE" if enable else "/DISABLE"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    elif mode == "systemd":
         if os.path.exists("/etc/NIXOS"):
             print(
                 f"{YELLOW}NixOS systemd unit is declarative. Set services.mobile-rc.enable in your NixOS config and run sudo nixos-rebuild switch.{NC}",
@@ -508,7 +613,23 @@ def manage_boot_autostart(enable):
 def manage_runtime_service(action):
     _require_root_for_service(f"--{action}")
     mode = _detect_init_mode()
-    if mode == "systemd":
+    if mode == "schtasks":
+        if action in ("stop", "restart"):
+            subprocess.run(["schtasks", "/End", "/TN", "Mobile-RC"], capture_output=True, text=True, check=False)
+            ps = _find_bin("powershell") or "powershell"
+            subprocess.run(
+                [ps, "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*Mobile-RC*server.py*' -or $_.ExecutablePath -like '*Mobile-RC*mobile-rc.exe' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        if action in ("start", "restart"):
+            res = subprocess.run(["schtasks", "/Run", "/TN", "Mobile-RC"], capture_output=True, text=True, check=False)
+            if res.returncode != 0:
+                print(f"{RED}schtasks /Run failed: {(res.stderr or res.stdout).strip()}{NC}", file=sys.stderr)
+                sys.exit(1)
+    elif mode == "systemd":
         res = subprocess.run(["systemctl", action, "mobile-rc.service"], capture_output=True, text=True, check=False)
         if res.returncode != 0:
             print(f"{RED}systemctl {action} failed: {(res.stderr or res.stdout).strip()}{NC}", file=sys.stderr)
@@ -543,6 +664,7 @@ def manage_runtime_service(action):
     else:
         if action in ("stop", "restart") and _find_bin("pkill"):
             subprocess.run(["pkill", "-f", "/opt/mobile-rc/server.py"], check=False)
+            subprocess.run(["pkill", "-f", "/opt/mobile-rc/mobile-rc"], check=False)
         if action in ("start", "restart"):
             env = os.environ.copy()
             if os.path.exists(CONFIG_FILE):
@@ -553,9 +675,10 @@ def manage_runtime_service(action):
                         env["MRC_USER"] = t_user
                 except Exception:
                     pass
+            bin_cmd = ["/opt/mobile-rc/mobile-rc"] if os.access("/opt/mobile-rc/mobile-rc", os.X_OK) else [sys.executable, "/opt/mobile-rc/server.py"]
             with open("/var/log/mobile-rc.log", "ab") as logf:
                 subprocess.Popen(
-                    [sys.executable, "/opt/mobile-rc/server.py"],
+                    bin_cmd,
                     env=env,
                     stdin=subprocess.DEVNULL,
                     stdout=logf,

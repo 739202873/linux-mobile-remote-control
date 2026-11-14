@@ -96,6 +96,38 @@ if [ -f "${SCRIPT_DIR}/bin/control-access" ]; then
     chmod 755 /usr/local/bin/control-access
 fi
 
+# Metode C (Hybrid Runtime Resolution for optional Fase 3 Rust daemon)
+RUNTIME_BIN="${PYTHON_BIN}"
+RUNTIME_ARGS="${INSTALL_DIR}/server.py"
+ARCH_RAW="$(uname -m)"
+if [ "${MRC_RUNTIME:-auto}" = "rust" ] || [ "${MRC_USE_RUST:-0}" = "1" ]; then
+    if [ -x "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" ]; then
+        cp -f "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" "${INSTALL_DIR}/mobile-rc"
+    elif [ -f "${SCRIPT_DIR}/daemon-rs/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+        echo -e "${BLUE}   Building Rust daemon from source (cargo build --release)...${NC}"
+        cargo build --release --manifest-path "${SCRIPT_DIR}/daemon-rs/Cargo.toml" || true
+        [ -x "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" ] && cp -f "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" "${INSTALL_DIR}/mobile-rc"
+    elif command -v curl >/dev/null 2>&1; then
+        case "${ARCH_RAW}" in
+            x86_64|amd64) RUST_ASSET="mobile-rc-linux-x86_64" ;;
+            aarch64|arm64) RUST_ASSET="mobile-rc-linux-aarch64" ;;
+            *) RUST_ASSET="" ;;
+        esac
+        if [ -n "${RUST_ASSET}" ]; then
+            curl -fsSL "https://github.com/739202873/linux-mobile-remote-control/releases/latest/download/${RUST_ASSET}" -o "${INSTALL_DIR}/mobile-rc.tmp" 2>/dev/null && mv -f "${INSTALL_DIR}/mobile-rc.tmp" "${INSTALL_DIR}/mobile-rc" || rm -f "${INSTALL_DIR}/mobile-rc.tmp"
+        fi
+    fi
+    if [ -f "${INSTALL_DIR}/mobile-rc" ]; then
+        chmod 700 "${INSTALL_DIR}/mobile-rc"
+        RUNTIME_BIN="${INSTALL_DIR}/mobile-rc"
+        RUNTIME_ARGS=""
+        echo -e "${GREEN}   Using Hybrid native runtime: ${RUNTIME_BIN}${NC}"
+    else
+        echo -e "${YELLOW}   Native Rust binary not available yet; using Python server.py runtime.${NC}"
+    fi
+fi
+RUNTIME_CMD="${RUNTIME_BIN}${RUNTIME_ARGS:+ ${RUNTIME_ARGS}}"
+
 CONFIG_FILE="${INSTALL_DIR}/config.json"
 PIN_FILE="${INSTALL_DIR}/pin.txt"
 
@@ -165,7 +197,7 @@ After=network.target network-online.target
 Type=simple
 User=root
 Environment="MRC_USER=${TARGET_USER}"
-ExecStart=${PYTHON_BIN} /opt/mobile-rc/server.py
+ExecStart=${RUNTIME_CMD}
 Restart=always
 RestartSec=3
 
@@ -182,9 +214,9 @@ elif command -v rc-service >/dev/null 2>&1 && [ -d /etc/init.d ]; then
     cat << EOF > /etc/init.d/mobile-rc
 #!/sbin/openrc-run
 name="Mobile-RC"
-description="Universal Linux Remote Web Dashboard"
-command="${PYTHON_BIN}"
-command_args="/opt/mobile-rc/server.py"
+description="Universal Cross-Platform Remote Web Dashboard"
+command="${RUNTIME_BIN}"
+command_args="${RUNTIME_ARGS}"
 command_background=true
 pidfile="/run/\${RC_SVCNAME}.pid"
 export MRC_USER="${TARGET_USER}"
@@ -203,7 +235,7 @@ elif command -v dinitctl >/dev/null 2>&1 && [ -d /etc/dinit.d ] && dinitctl list
     ENV_BIN="$(command -v env || echo /usr/bin/env)"
     cat << EOF > /etc/dinit.d/mobile-rc
 type = process
-command = ${ENV_BIN} MRC_USER=${TARGET_USER} ${PYTHON_BIN} /opt/mobile-rc/server.py
+command = ${ENV_BIN} MRC_USER=${TARGET_USER} ${RUNTIME_CMD}
 restart = true
 smooth-recovery = true
 logfile = /var/log/mobile-rc.log
@@ -232,7 +264,7 @@ elif command -v sv >/dev/null 2>&1 && { [ -d /var/service ] || [ -d /run/runit/s
 #!/bin/sh
 exec 2>&1
 export MRC_USER="${TARGET_USER}"
-exec ${PYTHON_BIN} /opt/mobile-rc/server.py >>/var/log/mobile-rc.log
+exec ${RUNTIME_CMD} >>/var/log/mobile-rc.log
 EOF
     chmod 755 "${RUNIT_SV_BASE}/mobile-rc/run"
     ln -sfn "${RUNIT_SV_BASE}/mobile-rc" "${RUNIT_SVC_BASE}/mobile-rc"
@@ -246,8 +278,13 @@ EOF
 else
     echo -e "${YELLOW}Warning: Unrecognized init system. Launching background process via nohup.${NC}"
     pkill -f "/opt/mobile-rc/server.py" 2>/dev/null || true
+    pkill -f "/opt/mobile-rc/mobile-rc" 2>/dev/null || true
     sleep 1
-    MRC_USER="${TARGET_USER}" nohup "${PYTHON_BIN}" /opt/mobile-rc/server.py >/var/log/mobile-rc.log 2>&1 &
+    if [ -n "${RUNTIME_ARGS}" ]; then
+        MRC_USER="${TARGET_USER}" nohup "${RUNTIME_BIN}" "${RUNTIME_ARGS}" >/var/log/mobile-rc.log 2>&1 &
+    else
+        MRC_USER="${TARGET_USER}" nohup "${RUNTIME_BIN}" >/var/log/mobile-rc.log 2>&1 &
+    fi
 fi
 
 IP_LOCAL=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1 || hostname -I 2>/dev/null | awk '{print $1}' || true)

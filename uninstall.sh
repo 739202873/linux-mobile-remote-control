@@ -45,6 +45,7 @@ if command -v sv >/dev/null 2>&1 || [ -d /etc/sv/mobile-rc ] || [ -d /etc/runit/
 fi
 
 pkill -f "/opt/mobile-rc/server.py" 2>/dev/null || true
+pkill -f "/opt/mobile-rc/mobile-rc" 2>/dev/null || true
 rm -rf /opt/mobile-rc /usr/local/bin/control-access /usr/local/bin/kontrol-laptop
 rm -rf /tmp/mrc_shot_* /tmp/mrc_raw.png /tmp/mrc_live_shot.jpg /var/log/mobile-rc.log
 

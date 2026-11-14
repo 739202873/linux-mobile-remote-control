@@ -1,10 +1,10 @@
-# Linux Mobile Control Center 
+# Mobile-RC — Cross-Platform Control Center (Linux & Windows)
 
 > [!NOTE]
 > **Project Status: Under Active Development**
-> Core monitoring, screen preview, multi-boot switching, service control, and OTP authentication are live. Extended Desktop PC controls (DDC/CI external brightness, GPU sensors), System Logs, Installed Distros scanner, interactive Desktop Terminal Prompt injection, Feedback Reporting, and the native Flutter `.apk` client (`mobile-app/`) are currently under active development.
+> Core monitoring, Bento Grid responsive UI, live screen preview, multi-boot switching, process/service manager, paired device management, remote touchpad, Windows 10/11 host support, and OTP authentication are live. Native mobile apps (`mobile-app/`) and optional high-efficiency Rust daemon (`daemon-rs/`) are currently under active development.
 
-A lightweight, zero-dependency Web Dashboard & Android companion suite written in pure Python 3 to monitor hardware health, inspect system logs and installed distros, preview desktop screens, and control multi-boot Linux Desktop PCs, Workstations, and Laptops directly from your smartphone (locally or over the internet).
+A lightweight, zero-dependency Web Dashboard & remote control daemon written in pure Python 3 to monitor hardware health (with real-time sparklines), manage processes and system services, inspect logs/OS inventory, preview live desktop screens, and control Linux Desktop PCs, Laptops, Workstations, and **Windows 10/11** machines directly from your smartphone (locally or over the internet).
 
 Universally engineered to work seamlessly across major Linux distributions and desktop environments / window managers.
 
@@ -25,6 +25,7 @@ Linux Mobile Control Center is designed to be universal across the entire Linux 
 | **Fedora / RHEL** | Fedora Workstation/Silverblue, RHEL, AlmaLinux, Rocky | `systemd` | Supported |
 | **openSUSE** | openSUSE Tumbleweed, openSUSE Leap | `systemd` | Supported |
 | **Independent / Minimal**| Alpine Linux, Artix Linux, Chimera Linux, Void Linux | `OpenRC` / `dinit` / `runit` / `systemd` | Supported |
+| **Microsoft Windows** | Windows 10, Windows 11 (x64 / ARM64) | `Task Scheduler` (`schtasks`) | Supported |
 
 ---
 
@@ -53,15 +54,14 @@ Linux Mobile Control Center intelligently adapts its screen capture, clipboard s
 
 ##  Features
 
-- **Real-time System Monitor (Desktop PC & Laptop Ready):** Live telemetry of CPU load, CPU/GPU temperatures, RAM & Swap usage, NIC RX/TX throughput & MAC addresses (for Wake-on-LAN), adaptive Power/GPU status (plus Battery/UPS when present), and disk partitions (NVMe, SATA, Btrfs, LVM/LUKS).
-- **Silent Live Screen Preview & Dynamic Workspaces:** Auto-refreshing desktop preview (`Live ON / PAUSED` toggle) without switching windows or tabs on the PC / laptop, paired with dynamic workspace buttons matching active PC workspaces (wrapping below after 4 columns) plus Fullscreen, Screen On/Off (DPMS), and Close App controls supporting Hyprland `0.57.1+` Lua API (`hl.dsp.*`), Niri (`niri msg`), KDE Plasma 6 (`qdbus6` / `kdotool` / `kscreen-doctor`), River (`riverctl`), Sway, `wlopm`, `wmctrl`, `xdotool`, and `xset`.
-- **Installed Distros & Multi-Boot OS Switcher:** Combines live OS/init/compositor metadata, `efibootmgr`, `systemd-boot`, `GRUB` entries, mounted Btrfs subvolumes, `os-prober`, and an optional read-only unmounted partition scan (`?deep=1`), paired with one-click UEFI `BootNext`, firmware setup, lock screen, suspend, reboot, and shutdown.
-- **System Logs Viewer:** Inspect `journalctl` (`systemd`), `/var/log/messages` / `syslog` / `rc.log` / `socklog` (`OpenRC` / `dinit` / `runit`), `dmesg`, and `mobile-rc` daemon logs with source and keyword filters.
-- **Media, Volume & Display Brightness (Internal + External Monitors):** Control system volume (slider, +/-5%, mute), laptop backlight (`brightnessctl` / `light`) or external desktop monitor brightness via DDC/CI (`ddcutil`), and media playback via `playerctl`, `wpctl`, and `pactl`.
-- **Bi-directional File Sharing & Built-in Feedback Inbox:** Upload/download files (`~/Downloads`) and submit suggestions or bug reports from the rightmost dashboard tab (hybrid delivery to maintainer inbox via local SMTP, optional `MRC_FEEDBACK_WEBHOOK`, or `mailto:` / GitHub fallback).
-- **Interactive Prompt & Remote Input:** Send desktop notifications, sync clipboard, open URLs, launch presets, control mouse/keyboard input (`ydotool` / `wtype` / `xdotool`), and run terminal prompts either quietly (`Run Silent`), visibly in a desktop terminal window (`Open on Screen`), or typed directly into the focused PC window (`Type to Active` with optional `Auto-Enter`).
-- **On-Demand Random Code, Bearer Device Tokens & Email OTP:** Single-use 6-digit codes (`control-access`), persistent hashed Bearer tokens for the native Flutter `.apk`, and remote SMTP Email OTP restricted to whitelisted emails.
-- **Zero External Python Dependencies:** Host daemon uses strictly the Python 3 Standard Library.
+- **Bento Grid Responsive UI & Real-Time Telemetry:** Adaptive sidebar rail on desktop/tablet (`>=768px`) and thumb-friendly bottom bar on phones (`<768px`), tabular numbers, 30-point CPU & Network throughput SVG sparklines, visibility-aware polling (`/api/telemetry` every 3.5s, auto-paused when tab hidden), and zero external font/icon CDN requests.
+- **Silent Live Screen Preview & Fullscreen Viewer:** Configurable live refresh selector (`Off`, `1s`, `2s`, `5s`), click-to-expand fullscreen desktop view, and dynamic workspace/window controls across Linux compositors (`Hyprland`, `Niri`, `KDE Plasma 6`, `River`, `Sway`, `X11`) and Windows Desktop (`CopyFromScreen`, `F11`, `Alt+F4`, display sleep).
+- **System Logs, Live Processes & Service Manager:** Inspect `journalctl`, OpenRC/syslog/dmesg or Windows Event Logs (`System`/`Application`), view top CPU/RAM processes with safe kill confirmation, and `start` / `stop` / `restart` host services (`systemd`, `OpenRC`, `dinit`, `runit`, or Windows Services).
+- **Paired Mobile Devices, LAN/WoL & File Sharing:** Revoke paired mobile Bearer tokens on demand, inspect LAN IPs & Wake-on-LAN MAC addresses, upload/download files (`Downloads`), and toggle opt-in HTTPS tunneling (`localhost.run`).
+- **Installed OS Scanner & Multi-Boot Switcher:** Inspect UEFI boot entries, `systemd-boot`/`GRUB`, WSL2 distros (on Windows), Btrfs subvolumes, and optional unmounted Linux root probing, paired with safe modal-confirmed Reboot, Shutdown, Lock, Sleep, and UEFI Firmware setup.
+- **Media, Volume, Display Brightness & Remote Touchpad:** Control playback, audio volume (`wpctl`/`pactl` on Linux, Windows CoreAudio COM), display brightness (`brightnessctl`/`ddcutil`/`hyprsunset` on Linux, Windows WMI), and low-latency relative cursor/click/scroll/key injection (`ydotool`/`wtype`/`xdotool` on Linux, Win32 `user32` on Windows).
+- **On-Demand Random Code (RAC), Device Tokens & Email OTP:** Single-use 6-digit codes (`control-access`), hashed Bearer tokens for native clients, and remote SMTP Email OTP for non-local access.
+- **Zero External Python Dependencies:** Host daemon and CLI use strictly Python 3 Standard Library (`ctypes`, `http.server`, `smtplib`).
 
 ---
 
@@ -76,10 +76,13 @@ linux-mobile-remote-control/
 │   └── control-access    # Host CLI: random codes, Termux setup, --pair-info & Email OTP
 ├── termux/
 │   └── control-access    # Termux client CLI for smartphone pairing & quick login
-├── server.py             # Core HTTP API server, UDP discovery & web dashboard UI (Pure Python 3)
-├── install.sh            # Universal installer (systemd, OpenRC, dinit & runit)
-├── update.sh             # Safe updater script (preserves tokens, config & SSH keys)
-├── uninstall.sh          # Clean uninstaller script
+├── server.py             # Core HTTP API server, UDP discovery & Bento web UI (Python 3 stdlib)
+├── install.sh            # Universal Linux installer (systemd, OpenRC, dinit & runit)
+├── update.sh             # Safe Linux updater (preserves tokens, config & SSH keys)
+├── uninstall.sh          # Clean Linux uninstaller
+├── install.ps1           # Windows 10/11 installer (Scheduled Task, Firewall & control-access.cmd)
+├── update.ps1            # Safe Windows updater with syntax check & auto-rollback
+├── uninstall.ps1         # Clean Windows uninstaller
 ├── .gitignore            # Git exclusion rules
 ├── LICENSE               # MIT License
 └── README.md             # Project documentation
@@ -114,6 +117,26 @@ linux-mobile-remote-control/
    ```
 
 3. The installer will automatically detect your init system (**systemd**, **OpenRC**, **dinit**, or **runit**), register the background service, and launch the dashboard on port `8000`.
+
+### Windows 10 / 11 (Administrator PowerShell)
+
+1. Install **Python 3.8+** (`winget install Python.Python.3.12`) and clone this repository:
+   ```powershell
+   git clone https://github.com/739202873/linux-mobile-remote-control.git
+   cd linux-mobile-remote-control
+   ```
+2. Run the PowerShell installer as **Administrator**:
+   ```powershell
+   Set-ExecutionPolicy -Scope Process Bypass -Force
+   .\install.ps1
+   ```
+3. To update or uninstall later:
+   ```powershell
+   .\update.ps1
+   .\uninstall.ps1
+   ```
+
+The Windows installer configures `%ProgramData%\Mobile-RC`, opens Windows Firewall TCP `8000` / UDP `8001`, registers interactive Scheduled Task `Mobile-RC`, and installs `control-access.cmd` into `System32`.
 
 ### NixOS (Declarative Flake Module)
 

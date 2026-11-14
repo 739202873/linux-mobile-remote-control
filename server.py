@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Mobile-RC (Linux Mobile Control Center) — Pure Python Stdlib Server."""
+"""Mobile-RC (Cross-Platform Linux & Windows Control Center) — Pure Python Stdlib Server."""
 
 from collections import deque
+import csv
+import ctypes
 from email.message import EmailMessage
 from http import HTTPStatus
 import hashlib
@@ -13,7 +15,10 @@ import json
 import mimetypes
 import os
 import platform
-import pwd
+try:
+    import pwd
+except ImportError:
+    pwd = None
 import re
 import secrets
 import shutil
@@ -29,10 +34,42 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+IS_WINDOWS = os.name == "nt"
+
+
+def _default_config_dir():
+    env_dir = os.environ.get("MRC_CONFIG_DIR", "").strip()
+    if env_dir:
+        return env_dir
+    if IS_WINDOWS:
+        prog_data = os.environ.get("ProgramData", r"C:\ProgramData")
+        cand = os.path.join(prog_data, "Mobile-RC")
+        try:
+            os.makedirs(cand, exist_ok=True)
+            test_f = os.path.join(cand, ".perm_check")
+            with open(test_f, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(test_f)
+            return cand
+        except OSError:
+            local_app = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+            return os.path.join(local_app, "Mobile-RC")
+    return "/opt/mobile-rc"
+
+
+def _is_root_or_admin():
+    if IS_WINDOWS:
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
 PORT = int(os.environ.get("MRC_PORT", "8000"))
 DISCOVERY_PORT = int(os.environ.get("MRC_DISCOVERY_PORT", "8001"))
 DISCOVERY_ENABLED = os.environ.get("MRC_DISCOVERY", "1").strip().lower() not in ("0", "false", "no")
-CONFIG_DIR = os.environ.get("MRC_CONFIG_DIR", "/opt/mobile-rc")
+CONFIG_DIR = _default_config_dir()
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 PIN_FILE = os.path.join(CONFIG_DIR, "pin.txt")
 SSH_KEY_FILE = os.path.join(CONFIG_DIR, "ssh_id_ed25519")
@@ -137,6 +174,41 @@ _PROC_LAST = None
 _DISTRO_SCAN_LOCK = threading.Lock()
 _DISTRO_CACHE = {"safe": None, "deep": None}
 _AUDIT_LOG = deque(maxlen=150)
+_TTL_CACHE = {}
+_TTL_LOCK = threading.Lock()
+_CONFIG_MTIME_CACHE = None  # (path, mtime_ns, size, dict)
+
+
+def _cached(key, ttl_sec, fn, force=False):
+    now = time.monotonic()
+    if not force:
+        with _TTL_LOCK:
+            entry = _TTL_CACHE.get(key)
+            if entry is not None and (now - entry[0]) < ttl_sec:
+                val = entry[1]
+                if isinstance(val, dict):
+                    return dict(val)
+                if isinstance(val, list):
+                    return list(val)
+                return val
+    val = fn()
+    with _TTL_LOCK:
+        _TTL_CACHE[key] = (time.monotonic(), val)
+    if isinstance(val, dict):
+        return dict(val)
+    if isinstance(val, list):
+        return list(val)
+    return val
+
+
+def _invalidate_cache(*prefixes):
+    with _TTL_LOCK:
+        if not prefixes:
+            _TTL_CACHE.clear()
+            return
+        keys = [k for k in _TTL_CACHE if any(str(k).startswith(p) for p in prefixes)]
+        for k in keys:
+            _TTL_CACHE.pop(k, None)
 
 
 def record_audit_event(level, message):
@@ -160,10 +232,11 @@ class _BadRequestError(Exception):
 
 def _ensure_config_dir():
     os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(CONFIG_DIR, 0o700)
-    except OSError:
-        pass
+    if not IS_WINDOWS:
+        try:
+            os.chmod(CONFIG_DIR, 0o700)
+        except OSError:
+            pass
 
 
 def _write_secure_file(path, content, mode=0o600):
@@ -176,7 +249,8 @@ def _write_secure_file(path, content, mode=0o600):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
-        os.chmod(path, mode)
+        if not IS_WINDOWS:
+            os.chmod(path, mode)
     except Exception:
         try:
             os.close(fd)
@@ -186,25 +260,42 @@ def _write_secure_file(path, content, mode=0o600):
 
 
 def get_config():
+    global _CONFIG_MTIME_CACHE
     with _CONFIG_LOCK:
         try:
             if os.path.exists(CONFIG_FILE):
+                st = os.stat(CONFIG_FILE)
+                if (
+                    _CONFIG_MTIME_CACHE is not None
+                    and _CONFIG_MTIME_CACHE[0] == CONFIG_FILE
+                    and _CONFIG_MTIME_CACHE[1] == st.st_mtime_ns
+                    and _CONFIG_MTIME_CACHE[2] == st.st_size
+                ):
+                    return dict(_CONFIG_MTIME_CACHE[3])
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, dict):
-                        return data
+                        _CONFIG_MTIME_CACHE = (CONFIG_FILE, st.st_mtime_ns, st.st_size, dict(data))
+                        return dict(data)
         except Exception:
             pass
     return {}
 
 
 def save_config(data):
+    global _CONFIG_MTIME_CACHE
     with _CONFIG_LOCK:
         try:
             _ensure_config_dir()
             _write_secure_file(CONFIG_FILE, json.dumps(data, indent=2) + "\n", 0o600)
+            try:
+                st = os.stat(CONFIG_FILE)
+                _CONFIG_MTIME_CACHE = (CONFIG_FILE, st.st_mtime_ns, st.st_size, dict(data))
+            except OSError:
+                _CONFIG_MTIME_CACHE = None
         except Exception:
-            pass
+            _CONFIG_MTIME_CACHE = None
+    _invalidate_cache("target_user")
 
 
 def _is_auto_tunnel_enabled():
@@ -221,8 +312,17 @@ def _is_auto_tunnel_enabled():
     return _TUNNEL_AUTO
 
 
-def get_target_user_info():
-    """Return (username, uid, gid, home_dir) of the target non-root desktop user."""
+def _compute_target_user_info():
+    if IS_WINDOWS or pwd is None:
+        user = (
+            os.environ.get("MRC_USER", "").strip()
+            or os.environ.get("USERNAME", "").strip()
+            or os.environ.get("USER", "").strip()
+            or "user"
+        )
+        home = os.path.expanduser("~")
+        return user, 0, 0, home
+
     cfg = get_config()
     cfg_user = str(cfg.get("target_user") or cfg.get("user") or "").strip()
     candidates = [
@@ -241,7 +341,6 @@ def get_target_user_info():
         except KeyError:
             continue
 
-    # Detect non-root user with a /home/<user> directory
     try:
         for entry in sorted(os.listdir("/home")):
             full = os.path.join("/home", entry)
@@ -256,7 +355,6 @@ def get_target_user_info():
     except OSError:
         pass
 
-    # Fallback: scan passwd for regular interactive human accounts
     try:
         for pw in pwd.getpwall():
             if 1000 <= pw.pw_uid < 60000 and not pw.pw_shell.endswith(("nologin", "false")):
@@ -267,26 +365,33 @@ def get_target_user_info():
     return "root", 0, 0, "/root"
 
 
+def get_target_user_info():
+    """Return (username, uid, gid, home_dir) of the target desktop user (cached 30s)."""
+    key = f"target_user:{CONFIG_FILE}:{os.environ.get('MRC_USER', '')}"
+    return _cached(key, 30.0, _compute_target_user_info)
+
+
 def get_downloads_dir():
     """Locate the target user's Downloads directory cleanly."""
     _, uid, gid, home = get_target_user_info()
-    xdg_file = os.path.join(home, ".config", "user-dirs.dirs")
-    if os.path.exists(xdg_file):
-        try:
-            with open(xdg_file, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("XDG_DOWNLOAD_DIR="):
-                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        val = val.replace("$HOME", home)
-                        if os.path.isdir(val):
-                            return val
-        except Exception:
-            pass
+    if not IS_WINDOWS:
+        xdg_file = os.path.join(home, ".config", "user-dirs.dirs")
+        if os.path.exists(xdg_file):
+            try:
+                with open(xdg_file, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("XDG_DOWNLOAD_DIR="):
+                            val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            val = val.replace("$HOME", home)
+                            if os.path.isdir(val):
+                                return val
+            except Exception:
+                pass
     dl = os.path.join(home, "Downloads")
     try:
         os.makedirs(dl, exist_ok=True)
-        if os.geteuid() == 0 and uid != 0:
+        if not IS_WINDOWS and hasattr(os, "geteuid") and os.geteuid() == 0 and uid != 0:
             os.chown(dl, uid, gid)
     except Exception:
         pass
@@ -723,20 +828,31 @@ def set_pin(new_pin):
 
 
 def _merge_path_dirs(*groups):
-    """Merge colon-separated PATH groups while preserving priority order and uniqueness."""
+    """Merge PATH groups while preserving priority order and uniqueness."""
+    sep = os.pathsep
     parts = []
     seen = set()
     for group in groups:
-        for entry in str(group or "").split(":"):
+        for entry in str(group or "").split(sep):
             entry = entry.strip()
             if entry and entry not in seen:
                 seen.add(entry)
                 parts.append(entry)
-    return ":".join(parts)
+    return sep.join(parts)
 
 
 def get_system_path():
-    """Return an expanded PATH covering both FHS and NixOS system/wrapper locations."""
+    """Return an expanded PATH covering Windows or FHS/NixOS system/wrapper locations."""
+    if IS_WINDOWS:
+        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+        win_dirs = os.pathsep.join([
+            os.path.join(sys_root, "System32"),
+            sys_root,
+            os.path.join(sys_root, "System32", "Wbem"),
+            os.path.join(sys_root, "System32", "WindowsPowerShell", "v1.0"),
+            os.path.join(sys_root, "System32", "OpenSSH"),
+        ])
+        return _merge_path_dirs(os.environ.get("PATH", ""), win_dirs)
     return _merge_path_dirs(
         os.environ.get("PATH", ""),
         "/run/wrappers/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin",
@@ -745,25 +861,76 @@ def get_system_path():
 
 
 def find_bin(name, search_path=None):
-    """Locate an executable in explicit/NixOS/FHS PATHs."""
-    return shutil.which(name, path=search_path or get_system_path())
+    """Locate an executable in explicit/NixOS/FHS/Windows PATHs."""
+    eff_path = search_path or get_system_path()
+    return _cached(f"find_bin:{name}:{eff_path}", 30.0, lambda: shutil.which(name, path=eff_path))
 
 
-def run_cmd(cmd, timeout=8, shell=False):
-    """Execute a system command cleanly without unintended shell expansion."""
+def _win_creationflags():
+    """Return CREATE_NO_WINDOW flag on Windows to avoid console window flashes."""
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+
+
+def _win_run_ps(ps_script, timeout=8, extra_env=None):
+    """Execute a hidden PowerShell snippet cleanly without shell interpolation."""
+    ps_bin = find_bin("powershell") or "powershell"
+    env = os.environ.copy()
+    env["PATH"] = get_system_path()
+    if extra_env:
+        for k, v in extra_env.items():
+            env[k] = str(v)
     try:
-        env = os.environ.copy()
-        env["PATH"] = get_system_path()
-        env["LC_ALL"] = "C"
         res = subprocess.run(
-            cmd,
-            shell=shell,
+            [ps_bin, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_script],
             env=env,
             capture_output=True,
             text=True,
             timeout=timeout,
+            creationflags=_win_creationflags(),
         )
-        return res.returncode, res.stdout.strip(), res.stderr.strip()
+        return res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip()
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def _win_send_vk(vk_code, hold_alt=False):
+    """Synthesize a hardware key press/release via Win32 user32.keybd_event."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        if hold_alt:
+            user32.keybd_event(0x12, 0, 0, 0)
+        user32.keybd_event(int(vk_code), 0, 0, 0)
+        user32.keybd_event(int(vk_code), 0, 2, 0)
+        if hold_alt:
+            user32.keybd_event(0x12, 0, 2, 0)
+        return True
+    except Exception:
+        return False
+
+
+def run_cmd(cmd, timeout=8, shell=False, encoding=None, errors="replace"):
+    """Execute a system command cleanly without unintended shell expansion."""
+    try:
+        env = os.environ.copy()
+        env["PATH"] = get_system_path()
+        if not IS_WINDOWS:
+            env["LC_ALL"] = "C"
+        kwargs = {
+            "shell": shell,
+            "env": env,
+            "capture_output": True,
+            "text": True,
+            "timeout": timeout,
+        }
+        if encoding is not None:
+            kwargs["encoding"] = encoding
+            kwargs["errors"] = errors
+        if IS_WINDOWS:
+            kwargs["creationflags"] = _win_creationflags()
+        res = subprocess.run(cmd, **kwargs)
+        return res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip()
     except Exception as e:
         return 1, "", str(e)
 
@@ -779,9 +946,17 @@ def run_first_system_cmd(cmd_variants, timeout=8):
     return 1, "", "No supported system utility found"
 
 
-def get_desktop_env():
+def _compute_desktop_env():
     """Inspect active processes strictly owned by the target user for GUI session env."""
     username, uid, _, home = get_target_user_info()
+    if IS_WINDOWS:
+        env = os.environ.copy()
+        env.setdefault("USERPROFILE", home)
+        env.setdefault("HOME", home)
+        env.setdefault("USERNAME", username)
+        env["PATH"] = get_system_path()
+        return env
+
     session_path = ""
     env = {
         "HOME": home,
@@ -880,6 +1055,12 @@ def get_desktop_env():
                 pass
     env.setdefault("DISPLAY", ":0")
     return env
+
+
+def get_desktop_env():
+    """Return target user's GUI session environment (cached 12s to avoid repeated /proc scans)."""
+    _, uid, _, _ = get_target_user_info()
+    return _cached(f"desktop_env:{uid}:{IS_WINDOWS}", 12.0, _compute_desktop_env)
 
 
 def get_active_compositor(env):
@@ -985,13 +1166,17 @@ def run_as_user(cmd, timeout=10, shell=False, input_text=None, background=False,
     """Run a command dropped to the target desktop user's UID and GID."""
     _, uid, gid, home = get_target_user_info()
     env = get_desktop_env()
-    kwargs = {"cwd": home if os.path.isdir(home) else "/"}
-    if os.geteuid() == 0 and uid != 0:
+    default_cwd = os.environ.get("SystemDrive", "C:\\") if IS_WINDOWS else "/"
+    kwargs = {"cwd": home if os.path.isdir(home) else default_cwd}
+    if not IS_WINDOWS and hasattr(os, "geteuid") and os.geteuid() == 0 and uid != 0:
         kwargs["user"] = uid
         kwargs["group"] = gid
 
     try:
         if background:
+            popen_kwargs = dict(kwargs)
+            if not IS_WINDOWS:
+                popen_kwargs["start_new_session"] = True
             subprocess.Popen(
                 cmd,
                 shell=shell,
@@ -999,8 +1184,7 @@ def run_as_user(cmd, timeout=10, shell=False, input_text=None, background=False,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True,
-                **kwargs,
+                **popen_kwargs,
             )
             return 0, "", ""
 
@@ -1059,6 +1243,20 @@ def spawn_terminal_with_command(cmd_str):
     """Open an interactive visible terminal emulator on the host desktop running cmd_str."""
     env = get_desktop_env()
     search_path = env["PATH"]
+    if IS_WINDOWS:
+        win_candidates = [
+            ("wt", ["powershell.exe", "-NoExit", "-Command", cmd_str]),
+            ("powershell", ["-NoExit", "-Command", cmd_str]),
+            ("cmd", ["/k", cmd_str]),
+        ]
+        for bin_name, args in win_candidates:
+            resolved = find_bin(bin_name, search_path)
+            if resolved:
+                run_as_user([resolved] + args, background=True, shell=False)
+                record_audit_event("INFO", f"Opened Windows terminal ({bin_name}) with command")
+                return True, bin_name
+        return False, "No Windows terminal emulator found"
+
     runner = 'printf "\\033[1;36m$ %s\\033[0m\\n" "$1"; eval "$1"; echo ""; exec "${SHELL:-/bin/sh}"'
     candidates = [
         ("kitty", ["-e", "sh", "-c", runner, "_", cmd_str]),
@@ -1080,10 +1278,47 @@ def spawn_terminal_with_command(cmd_str):
     return False, "No supported desktop terminal emulator found"
 
 
+def _escape_sendkeys(text):
+    """Escape special SendKeys characters for Windows Forms SendKeys::SendWait."""
+    out = []
+    for ch in str(text):
+        if ch in "+%^~()[]{}":
+            out.append("{" + ch + "}")
+        elif ch == "\n":
+            out.append("{ENTER}")
+        elif ch == "\r":
+            continue
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def type_prompt_to_active_window(text, auto_enter=True):
-    """Inject typed prompt text into the currently focused desktop window (Wayland/X11)."""
+    """Inject typed prompt text into the currently focused desktop window (Wayland/X11/Windows)."""
     env = get_desktop_env()
     search_path = env["PATH"]
+    if IS_WINDOWS:
+        escaped = _escape_sendkeys(text) + ("{ENTER}" if auto_enter else "")
+        ps_script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "[System.Windows.Forms.SendKeys]::SendWait($env:MRC_SENDKEYS_PAYLOAD)"
+        )
+        win_env = dict(env)
+        win_env["MRC_SENDKEYS_PAYLOAD"] = escaped
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                env=win_env,
+                capture_output=True,
+                text=True,
+                timeout=6,
+            )
+            if res.returncode == 0:
+                return True, "SendKeys"
+            return False, (res.stderr or res.stdout or "SendKeys failed").strip()
+        except Exception as e:
+            return False, str(e)
+
     if find_bin("wtype", search_path):
         rc, _, err = run_as_user(["wtype", "--", text], timeout=5)
         if rc == 0:
@@ -1112,8 +1347,70 @@ def type_prompt_to_active_window(text, auto_enter=True):
 
 # === SYSTEM TELEMETRY HELPERS ===
 
+class _WinFileTime(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", ctypes.c_uint32), ("dwHighDateTime", ctypes.c_uint32)]
+
+
+class _WinMemoryStatusEx(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_uint32),
+        ("dwMemoryLoad", ctypes.c_uint32),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
+
+
+class _WinPowerStatus(ctypes.Structure):
+    _fields_ = [
+        ("ACLineStatus", ctypes.c_ubyte),
+        ("BatteryFlag", ctypes.c_ubyte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("SystemStatusFlag", ctypes.c_ubyte),
+        ("BatteryLifeTime", ctypes.c_uint32),
+        ("BatteryFullLifeTime", ctypes.c_uint32),
+    ]
+
+
+class _WinPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def _get_windows_cpu_percent():
+    global _LAST_CPU
+    try:
+        idle_ft, kernel_ft, user_ft = _WinFileTime(), _WinFileTime(), _WinFileTime()
+        if not ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle_ft), ctypes.byref(kernel_ft), ctypes.byref(user_ft)
+        ):
+            return 0.0
+        idle = (idle_ft.dwHighDateTime << 32) | idle_ft.dwLowDateTime
+        kernel = (kernel_ft.dwHighDateTime << 32) | kernel_ft.dwLowDateTime
+        user = (user_ft.dwHighDateTime << 32) | user_ft.dwLowDateTime
+        total = kernel + user
+        if _LAST_CPU is None:
+            _LAST_CPU = (idle, total)
+            return 0.0
+        prev_idle, prev_total = _LAST_CPU
+        _LAST_CPU = (idle, total)
+        diff_total = total - prev_total
+        diff_idle = idle - prev_idle
+        if diff_total <= 0:
+            return 0.0
+        pct = 100.0 * (1.0 - (diff_idle / diff_total))
+        return round(max(0.0, min(100.0, pct)), 1)
+    except Exception:
+        return 0.0
+
+
 def get_cpu_percent():
     global _LAST_CPU
+    if IS_WINDOWS:
+        return _get_windows_cpu_percent()
     try:
         with open("/proc/stat", "r", encoding="utf-8") as f:
             line = f.readline()
@@ -1155,7 +1452,28 @@ def _collect_hwmon_temps(name_keywords):
     return temps
 
 
+def _get_windows_cpu_temp():
+    rc, out, _ = _win_run_ps(
+        "try { "
+        "$t = Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop "
+        "| Measure-Object -Property CurrentTemperature -Maximum; "
+        "if ($t.Maximum -gt 2000) { [math]::Round(($t.Maximum / 10.0) - 273.15, 1) } else { 0 } "
+        "} catch { 0 }",
+        timeout=4,
+    )
+    if rc == 0 and out:
+        try:
+            val = float(out.splitlines()[-1].strip())
+            if 5.0 < val < 130.0:
+                return round(val, 1)
+        except ValueError:
+            pass
+    return 0.0
+
+
 def get_cpu_temp():
+    if IS_WINDOWS:
+        return _cached("win_cpu_temp", 8.0, _get_windows_cpu_temp)
     temps = []
     try:
         temps = _collect_hwmon_temps(("k10temp", "coretemp", "zenpower", "cpu", "acpitz", "thinkpad"))
@@ -1175,8 +1493,8 @@ def get_cpu_temp():
     return round(max(temps), 1) if temps else 0.0
 
 
-def get_gpu_info():
-    """Detect desktop/laptop GPU utilization and temperature via nvidia-smi or DRM sysfs."""
+def _compute_gpu_info():
+    """Detect desktop/laptop GPU utilization and temperature across Linux and Windows."""
     if find_bin("nvidia-smi"):
         rc, out, _ = run_cmd([
             "nvidia-smi",
@@ -1195,6 +1513,17 @@ def get_gpu_info():
                     }
                 except ValueError:
                     pass
+
+    if IS_WINDOWS:
+        name = _cached("win_gpu_name", 180.0, lambda: (
+            _win_run_ps(
+                "(Get-CimInstance Win32_VideoController | Select-Object -First 1).Name",
+                timeout=4,
+            )[1]
+        ))
+        if name:
+            return {"available": True, "name": name.splitlines()[0].strip()[:64], "busy_pct": None, "temp_c": None}
+        return {"available": False, "name": "Integrated / Unknown", "busy_pct": None, "temp_c": None}
 
     drm_root = "/sys/class/drm"
     if os.path.isdir(drm_root):
@@ -1238,7 +1567,39 @@ def get_gpu_info():
     return {"available": False, "name": "Integrated / Unknown", "busy_pct": None, "temp_c": None}
 
 
+def get_gpu_info():
+    """Return cached GPU utilization and temperature (5s TTL avoids subprocess churn)."""
+    return _cached("gpu_info", 5.0, _compute_gpu_info)
+
+
+def _win_memory_status():
+    st = _WinMemoryStatusEx()
+    st.dwLength = ctypes.sizeof(_WinMemoryStatusEx)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+        return None
+    return st
+
+
 def get_swap_info():
+    if IS_WINDOWS:
+        try:
+            st = _win_memory_status()
+            if st is None:
+                return {"total_gb": 0.0, "used_gb": 0.0, "percent": 0.0}
+            page_total = max(0, st.ullTotalPageFile - st.ullTotalPhys)
+            if page_total <= 0:
+                return {"total_gb": 0.0, "used_gb": 0.0, "percent": 0.0}
+            ram_used = max(0, st.ullTotalPhys - st.ullAvailPhys)
+            commit_used = max(0, st.ullTotalPageFile - st.ullAvailPageFile)
+            page_used = min(page_total, max(0, commit_used - ram_used))
+            pct = round((page_used / page_total) * 100.0, 1)
+            return {
+                "total_gb": round(page_total / (1024 ** 3), 1),
+                "used_gb": round(page_used / (1024 ** 3), 1),
+                "percent": pct,
+            }
+        except Exception:
+            return {"total_gb": 0.0, "used_gb": 0.0, "percent": 0.0}
     mem = {}
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as f:
@@ -1259,8 +1620,23 @@ def get_swap_info():
         return {"total_gb": 0.0, "used_gb": 0.0, "percent": 0.0}
 
 
-def get_mac_addresses():
+def _compute_mac_addresses():
     macs = []
+    if IS_WINDOWS:
+        if find_bin("getmac"):
+            rc, out, _ = run_cmd(["getmac", "/FO", "CSV", "/NH"], timeout=4)
+            if rc == 0 and out:
+                idx = 1
+                for row in csv.reader(out.splitlines()):
+                    if not row:
+                        continue
+                    raw_mac = row[0].strip().replace("-", ":").lower()
+                    if re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", raw_mac) and raw_mac != "00:00:00:00:00:00":
+                        iface = row[1].strip() if len(row) > 1 and row[1].strip() else f"eth{idx}"
+                        macs.append({"iface": iface[:48], "mac": raw_mac})
+                        idx += 1
+        return macs
+
     net_dir = "/sys/class/net"
     if os.path.isdir(net_dir):
         for iface in sorted(os.listdir(net_dir)):
@@ -1278,24 +1654,47 @@ def get_mac_addresses():
     return macs
 
 
+def get_mac_addresses():
+    return _cached("mac_addresses", 30.0, _compute_mac_addresses)
+
+
+def _get_windows_net_bytes():
+    rc, out, _ = _win_run_ps(
+        "$rx=0L; $tx=0L; "
+        "[System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | "
+        "Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' } | "
+        "ForEach-Object { try { $s=$_.GetIPStatistics(); $rx+=$s.BytesReceived; $tx+=$s.BytesSent } catch {} }; "
+        '"$rx $tx"',
+        timeout=4,
+    )
+    if rc == 0 and out:
+        parts = out.splitlines()[-1].split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            return int(parts[0]), int(parts[1])
+    return 0, 0
+
+
 def get_network_telemetry():
-    """Return NIC MACs (WoL) and live total RX/TX throughput (KiB/s) from /proc/net/dev."""
+    """Return NIC MACs (WoL) and live total RX/TX throughput (KiB/s)."""
     global _NET_LAST
     rx_total = 0
     tx_total = 0
-    try:
-        with open("/proc/net/dev", "r", encoding="utf-8") as f:
-            for line in f.readlines()[2:]:
-                iface, _, rest = line.partition(":")
-                iface = iface.strip()
-                if not rest or iface == "lo":
-                    continue
-                cols = rest.split()
-                if len(cols) >= 9:
-                    rx_total += int(cols[0])
-                    tx_total += int(cols[8])
-    except Exception:
-        pass
+    if IS_WINDOWS:
+        rx_total, tx_total = _cached("win_net_bytes", 2.5, _get_windows_net_bytes)
+    else:
+        try:
+            with open("/proc/net/dev", "r", encoding="utf-8") as f:
+                for line in f.readlines()[2:]:
+                    iface, _, rest = line.partition(":")
+                    iface = iface.strip()
+                    if not rest or iface == "lo":
+                        continue
+                    cols = rest.split()
+                    if len(cols) >= 9:
+                        rx_total += int(cols[0])
+                        tx_total += int(cols[8])
+        except Exception:
+            pass
 
     now = time.monotonic()
     rx_kbps = 0.0
@@ -1312,36 +1711,71 @@ def get_network_telemetry():
     }
 
 
-def get_os_info():
-    os_name = platform.system()
-    try:
-        if os.path.exists("/etc/os-release"):
-            with open("/etc/os-release", "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    if line.startswith("PRETTY_NAME="):
-                        os_name = line.split("=", 1)[1].strip().strip("\"'")
-                        break
-    except Exception:
-        pass
-
-    uptime_str = "-"
-    try:
-        with open("/proc/uptime", "r", encoding="utf-8") as f:
-            sec = int(float(f.read().split()[0]))
-        h, m = sec // 3600, (sec % 3600) // 60
-        uptime_str = f"{h}h {m}m" if h else f"{m}m"
-    except Exception:
-        pass
-
+def _compute_os_static():
+    if IS_WINDOWS:
+        rel = platform.release() or "10/11"
+        os_name = f"Windows {rel}"
+        kernel = platform.version() or platform.release()
+    else:
+        os_name = platform.system()
+        try:
+            if os.path.exists("/etc/os-release"):
+                with open("/etc/os-release", "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if line.startswith("PRETTY_NAME="):
+                            os_name = line.split("=", 1)[1].strip().strip("\"'")
+                            break
+        except Exception:
+            pass
+        kernel = platform.release()
     return {
         "name": os_name,
         "hostname": socket.gethostname(),
-        "kernel": platform.release(),
-        "uptime": uptime_str,
+        "kernel": kernel,
     }
 
 
+def get_os_info():
+    base = _cached("os_static", 3600.0, _compute_os_static)
+    uptime_str = "-"
+    if IS_WINDOWS:
+        try:
+            sec = int(ctypes.windll.kernel32.GetTickCount64() // 1000)
+            h, m = sec // 3600, (sec % 3600) // 60
+            uptime_str = f"{h}h {m}m" if h else f"{m}m"
+        except Exception:
+            pass
+    else:
+        try:
+            with open("/proc/uptime", "r", encoding="utf-8") as f:
+                sec = int(float(f.read().split()[0]))
+            h, m = sec // 3600, (sec % 3600) // 60
+            uptime_str = f"{h}h {m}m" if h else f"{m}m"
+        except Exception:
+            pass
+
+    base["uptime"] = uptime_str
+    return base
+
+
 def get_memory_info():
+    if IS_WINDOWS:
+        try:
+            st = _win_memory_status()
+            if st is None:
+                return {"total_gb": 0.0, "used_gb": 0.0, "percent": 0.0}
+            total = st.ullTotalPhys
+            avail = st.ullAvailPhys
+            used = max(0, total - avail)
+            pct = round((used / total) * 100.0, 1) if total > 0 else 0.0
+            return {
+                "total_gb": round(total / (1024 ** 3), 1),
+                "used_gb": round(used / (1024 ** 3), 1),
+                "percent": pct,
+            }
+        except Exception:
+            return {"total_gb": 0.0, "used_gb": 0.0, "percent": 0.0}
+
     mem = {}
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as f:
@@ -1361,7 +1795,24 @@ def get_memory_info():
         return {"total_gb": 0.0, "used_gb": 0.0, "percent": 0.0}
 
 
+def _get_windows_battery_info():
+    try:
+        sps = _WinPowerStatus()
+        if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(sps)):
+            if (sps.BatteryFlag & 128) != 0 or sps.BatteryLifePercent == 255:
+                return {"has_battery": False, "has_ups": False, "percent": None, "status": "AC Desktop", "plugged": True}
+            pct = max(0, min(100, int(sps.BatteryLifePercent)))
+            plugged = sps.ACLineStatus == 1
+            st_lbl = "Charging" if plugged else "Discharging"
+            return {"has_battery": True, "has_ups": False, "percent": pct, "status": st_lbl, "plugged": plugged}
+    except Exception:
+        pass
+    return {"has_battery": False, "has_ups": False, "percent": None, "status": "AC Desktop", "plugged": True}
+
+
 def get_battery_info():
+    if IS_WINDOWS:
+        return _get_windows_battery_info()
     ps_dir = "/sys/class/power_supply"
     try:
         if os.path.isdir(ps_dir):
@@ -1397,14 +1848,37 @@ def get_battery_info():
 
 
 def _has_internal_backlight():
+    if IS_WINDOWS:
+        return False
     try:
         return os.path.isdir("/sys/class/backlight") and bool(os.listdir("/sys/class/backlight"))
     except OSError:
         return False
 
 
+def _win_set_brightness(mode, value=None):
+    ps = (
+        "$b = Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness -ErrorAction Stop | Select-Object -First 1; "
+        "$m = Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop | Select-Object -First 1; "
+        "$cur = [int]$b.CurrentBrightness; "
+        "$mode = $env:MRC_BRIGHT_MODE; "
+        "$val = [int]$env:MRC_BRIGHT_VAL; "
+        "if ($mode -eq 'up') { $target = [Math]::Min(100, $cur + 10) } "
+        "elseif ($mode -eq 'down') { $target = [Math]::Max(5, $cur - 10) } "
+        "else { $target = [Math]::Max(5, [Math]::Min(100, $val)) }; "
+        "$m.WmiSetBrightness(1, $target) | Out-Null; Write-Output $target"
+    )
+    rc, _, _ = _win_run_ps(ps, timeout=4, extra_env={"MRC_BRIGHT_MODE": mode, "MRC_BRIGHT_VAL": str(value or 50)})
+    if rc == 0:
+        _invalidate_cache("media_display")
+    return rc == 0
+
+
 def _adjust_brightness(mode, value=None):
-    """Adjust internal laptop backlight or external Desktop monitor brightness (DDC/CI or gamma)."""
+    """Adjust internal laptop backlight, Windows WMI display, or external Desktop monitor (DDC/CI / gamma)."""
+    if IS_WINDOWS:
+        return _win_set_brightness(mode, value)
+
     if _has_internal_backlight():
         if mode == "up":
             cmds = [["brightnessctl", "set", "+10%"], ["light", "-A", "10"]]
@@ -1414,8 +1888,11 @@ def _adjust_brightness(mode, value=None):
             cmds = [["brightnessctl", "set", f"{value}%"], ["light", "-S", str(value)]]
         rc, _, _ = run_first_available(cmds)
         if rc == 0:
+            _invalidate_cache("media_display")
             return True
         rc2, _, _ = run_first_system_cmd(cmds)
+        if rc2 == 0:
+            _invalidate_cache("media_display")
         return rc2 == 0
 
     if find_bin("ddcutil"):
@@ -1427,23 +1904,92 @@ def _adjust_brightness(mode, value=None):
             cmd = ["ddcutil", "--noverify", "setvcp", "10", str(value)]
         rc, _, _ = run_first_system_cmd([cmd], timeout=4)
         if rc == 0:
+            _invalidate_cache("media_display")
             return True
 
     if mode == "set" and value is not None:
         rc, _, _ = run_first_available([
             ["hyprctl", "hyprsunset", "gamma", str(value)],
         ], timeout=3)
+        if rc == 0:
+            _invalidate_cache("media_display")
         return rc == 0
     return False
 
 
-def get_media_and_display():
+_WIN_COREAUDIO_CS = (
+    "using System; using System.Runtime.InteropServices; "
+    "public class MrcAudio { "
+    "[Guid(\"5CDF2C82-841E-4546-9722-0CF74078229A\"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)] "
+    "interface IAudioEndpointVolume { "
+    "int f0(); int f1(); int f2(); int f3(); "
+    "int SetMasterVolumeLevelScalar(float fLevel, Guid pguidEventContext); "
+    "int f5(); int GetMasterVolumeLevelScalar(out float pfLevel); "
+    "int f7(); int f8(); int f9(); int f10(); "
+    "int SetMute([MarshalAs(UnmanagedType.Bool)] bool bMute, Guid pguidEventContext); "
+    "int GetMute(out bool pbMute); } "
+    "[Guid(\"D666063F-1587-4E43-81F1-B948E807363F\"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)] "
+    "interface IMMDevice { int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface); } "
+    "[Guid(\"A95664D2-9614-4F35-A746-DE8DB63617E6\"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)] "
+    "interface IMMDeviceEnumerator { int f0(); int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppDevice); } "
+    "[ComImport, Guid(\"BCDE0395-E52F-467C-8E3D-C4579291692E\")] class MMDeviceEnumerator {} "
+    "static IAudioEndpointVolume Ep() { "
+    "var en = (IMMDeviceEnumerator)(new MMDeviceEnumerator()); IMMDevice dev; en.GetDefaultAudioEndpoint(0, 1, out dev); "
+    "Guid iid = typeof(IAudioEndpointVolume).GUID; object obj; dev.Activate(ref iid, 23, IntPtr.Zero, out obj); "
+    "return (IAudioEndpointVolume)obj; } "
+    "public static string Get() { float v; bool m; var e = Ep(); e.GetMasterVolumeLevelScalar(out v); e.GetMute(out m); return ((int)Math.Round(v*100))+\"|\"+(m?1:0); } "
+    "public static void Set(int pct) { Ep().SetMasterVolumeLevelScalar(Math.Max(0f, Math.Min(1f, pct/100f)), Guid.Empty); } "
+    "}"
+)
+
+
+def _win_coreaudio_get():
+    ps = f"Add-Type -TypeDefinition @'\n{_WIN_COREAUDIO_CS}\n'@; [MrcAudio]::Get()"
+    rc, out, _ = _win_run_ps(ps, timeout=4)
+    if rc == 0 and "|" in out:
+        p = out.splitlines()[-1].strip().split("|")
+        if len(p) == 2 and p[0].isdigit():
+            return int(p[0]), p[1] == "1"
+    return None, None
+
+
+def _win_coreaudio_set(pct):
+    ps = f"Add-Type -TypeDefinition @'\n{_WIN_COREAUDIO_CS}\n'@; [MrcAudio]::Set([int]$env:MRC_VOL_PCT)"
+    rc, _, _ = _win_run_ps(ps, timeout=4, extra_env={"MRC_VOL_PCT": str(max(0, min(100, int(pct))))})
+    if rc == 0:
+        _invalidate_cache("media_display")
+    return rc == 0
+
+
+def _compute_media_and_display():
     vol = 50
     muted = False
     brightness = 50
     brightness_backend = "unavailable"
     media_status = "Stopped"
     media_title = "Nothing playing"
+
+    if IS_WINDOWS:
+        wv, wm = _win_coreaudio_get()
+        if wv is not None:
+            vol, muted = wv, bool(wm)
+        rc_b, out_b, _ = _win_run_ps(
+            "try { (Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness -ErrorAction Stop "
+            "| Select-Object -First 1).CurrentBrightness } catch {}",
+            timeout=3,
+        )
+        if rc_b == 0 and out_b.strip().isdigit():
+            brightness = max(5, min(100, int(out_b.strip())))
+            brightness_backend = "wmi"
+        return {
+            "volume": vol,
+            "muted": muted,
+            "brightness": brightness,
+            "brightness_backend": brightness_backend,
+            "media_status": "Windows Media",
+            "media_title": "Use Windows media keys",
+        }
+
     search_path = get_desktop_env()["PATH"]
 
     if find_bin("wpctl", search_path):
@@ -1491,6 +2037,10 @@ def get_media_and_display():
         "media_status": media_status,
         "media_title": media_title,
     }
+
+
+def get_media_and_display():
+    return _cached("media_display", 3.0, _compute_media_and_display)
 
 
 def _get_hyprland_workspaces():
@@ -1643,8 +2193,11 @@ def _get_kde_workspaces(search_path):
     return None
 
 
-def get_workspaces_info():
-    """Return active desktop workspaces sorted numerically across Wayland and X11 environments."""
+def _compute_workspaces_info():
+    """Return active desktop workspaces sorted numerically across Wayland, X11, and Windows."""
+    if IS_WINDOWS:
+        return [{"id": 1, "name": "Desktop", "active": True, "windows": 0}]
+
     env = get_desktop_env()
     search_path = env["PATH"]
     comp = get_active_compositor(env)
@@ -1698,6 +2251,20 @@ def get_workspaces_info():
     return [{"id": i, "name": str(i), "active": i == 1, "windows": 0} for i in range(1, 5)]
 
 
+def get_workspaces_info():
+    return _cached("workspaces_info", 2.5, _compute_workspaces_info)
+
+
+def _fmt_size_bytes(nbytes):
+    if nbytes >= 1024 ** 4:
+        return f"{nbytes / (1024 ** 4):.1f}T"
+    if nbytes >= 1024 ** 3:
+        return f"{nbytes / (1024 ** 3):.1f}G"
+    if nbytes >= 1024 ** 2:
+        return f"{nbytes / (1024 ** 2):.1f}M"
+    return f"{nbytes / 1024:.0f}K"
+
+
 def _collect_disk_nodes(nodes, out_list, seen=None):
     if seen is None:
         seen = set()
@@ -1731,8 +2298,37 @@ def _collect_disk_nodes(nodes, out_list, seen=None):
             _collect_disk_nodes(children, out_list, seen)
 
 
-def get_disks_info():
+def _compute_disks_info():
     disks = []
+    if IS_WINDOWS:
+        try:
+            mask = int(ctypes.windll.kernel32.GetLogicalDrives())
+            drive_types = {2: "Removable", 3: "Fixed", 4: "Network"}
+            for i in range(26):
+                if not (mask & (1 << i)):
+                    continue
+                letter = chr(65 + i)
+                root = f"{letter}:\\"
+                dtype = int(ctypes.windll.kernel32.GetDriveTypeW(root))
+                if dtype not in drive_types:
+                    continue
+                try:
+                    usage = shutil.disk_usage(root)
+                    pct = int(round((usage.used / usage.total) * 100.0)) if usage.total > 0 else 0
+                    disks.append({
+                        "part": f"{letter}:",
+                        "label": f"Drive ({letter}:)",
+                        "fstype": drive_types[dtype],
+                        "size": _fmt_size_bytes(usage.total),
+                        "use_pct": f"{pct}%",
+                        "mounted": True,
+                    })
+                except OSError:
+                    continue
+        except Exception:
+            pass
+        return disks
+
     if find_bin("lsblk"):
         rc, out, _ = run_cmd([
             "lsblk",
@@ -1749,8 +2345,35 @@ def get_disks_info():
     return disks
 
 
-def get_boot_entries():
+def get_disks_info(refresh=False):
+    return _cached("disks_info", 20.0, _compute_disks_info, force=refresh)
+
+
+def _compute_boot_entries():
     entries = []
+    if IS_WINDOWS:
+        if find_bin("bcdedit"):
+            rc, out, _ = run_cmd(["bcdedit", "/enum", "firmware"], timeout=5)
+            if rc == 0 and out:
+                cur_id = ""
+                cur_desc = ""
+                for raw in out.splitlines() + [""]:
+                    line = raw.strip()
+                    if not line:
+                        if cur_id and cur_desc and cur_id.lower() != "{fwbootmgr}":
+                            entries.append({"num": cur_id, "name": cur_desc})
+                        cur_id = ""
+                        cur_desc = ""
+                        continue
+                    parts = line.split(None, 1)
+                    if len(parts) == 2:
+                        k, v = parts[0].lower(), parts[1].strip()
+                        if k == "identifier":
+                            cur_id = v
+                        elif k == "description":
+                            cur_desc = v
+        return entries
+
     if find_bin("efibootmgr"):
         rc, out, _ = run_cmd(["efibootmgr"])
         if rc == 0 and out:
@@ -1767,8 +2390,13 @@ def get_boot_entries():
     return entries
 
 
-def detect_init_system():
-    """Detect the host Linux init system / service manager."""
+def get_boot_entries(refresh=False):
+    return _cached("boot_entries", 300.0, _compute_boot_entries, force=refresh)
+
+
+def _compute_init_system():
+    if IS_WINDOWS:
+        return "windows-svc"
     if os.path.isdir("/run/systemd/system"):
         return "systemd"
     if os.path.isdir("/run/openrc") or os.path.exists("/sbin/openrc-run"):
@@ -1795,6 +2423,11 @@ def detect_init_system():
     if find_bin("sv"):
         return "runit"
     return "unknown"
+
+
+def detect_init_system():
+    """Detect the host init system / service manager (cached across polling ticks)."""
+    return _cached("init_system", 3600.0, _compute_init_system)
 
 
 def _read_tail_lines(path, max_lines=150, max_bytes=524288):
@@ -1858,8 +2491,39 @@ def _parse_log_line(raw_line, source_name):
     }
 
 
+def _read_windows_event_logs(log_name, source_tag, max_events):
+    entries = []
+    ps = (
+        "try { "
+        "Get-WinEvent -LogName $env:MRC_EVT_LOG -MaxEvents ([int]$env:MRC_EVT_MAX) -ErrorAction Stop | "
+        "ForEach-Object { "
+        "$t = $_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); "
+        "$l = [string]$_.LevelDisplayName; "
+        "$p = [string]$_.ProviderName; "
+        "$m = ([string]$_.Message) -replace '[\\r\\n\\t]+',' '; "
+        '"$t|$l|$p|$m" '
+        "} } catch {}"
+    )
+    rc, out, _ = _win_run_ps(ps, timeout=6, extra_env={"MRC_EVT_LOG": log_name, "MRC_EVT_MAX": str(max_events)})
+    if rc == 0 and out:
+        for line in out.splitlines():
+            parts = line.split("|", 3)
+            if len(parts) < 4:
+                continue
+            ts, lvl_raw, prov, msg = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
+            lvl = _classify_log_level(f"{lvl_raw} {msg}")
+            entries.append({
+                "ts": ts,
+                "source": source_tag,
+                "level": lvl,
+                "message": f"[{prov}] {msg}"[:1200] if prov else msg[:1200],
+            })
+        entries.reverse()
+    return entries
+
+
 def get_system_logs(source="all", level="all", query="", lines=120):
-    """Aggregate bounded logs across systemd journal, syslog/OpenRC/socklog, dmesg, and mobile-rc."""
+    """Aggregate bounded logs across Windows Event Logs or Linux journal, syslog/OpenRC, dmesg, and mobile-rc."""
     src = (source or "all").strip().lower()
     lvl = (level or "all").strip().lower()
     q_low = str(query or "").strip().lower()[:120]
@@ -1868,74 +2532,84 @@ def get_system_logs(source="all", level="all", query="", lines=120):
     except (TypeError, ValueError):
         limit = 120
 
-    has_journal = bool(find_bin("journalctl"))
-    has_dmesg = bool(find_bin("dmesg"))
-    syslog_files = [
-        p for p in (
-            "/var/log/messages",
-            "/var/log/syslog",
-            "/var/log/socklog/everything/current",
-            "/var/log/everything/current",
-        )
-        if os.path.isfile(p)
-    ]
-    openrc_files = [p for p in ("/var/log/rc.log",) if os.path.isfile(p)]
-
-    available_sources = ["mobile-rc"]
-    if has_journal:
-        available_sources.append("journal")
-    if openrc_files:
-        available_sources.append("openrc")
-    if syslog_files:
-        available_sources.append("syslog")
-    if has_dmesg:
-        available_sources.append("dmesg")
-
-    entries = []
     per_src = limit if src != "all" else max(30, min(80, limit))
+    entries = []
 
-    if src in ("all", "mobile-rc"):
-        for item in list(_AUDIT_LOG)[-per_src:]:
-            entries.append(dict(item))
-        if os.path.isfile("/var/log/mobile-rc.log"):
-            for raw in _read_tail_lines("/var/log/mobile-rc.log", max_lines=per_src):
-                entries.append(_parse_log_line(raw, "mobile-rc"))
+    if IS_WINDOWS:
+        available_sources = ["mobile-rc", "system", "application"]
+        if src in ("all", "mobile-rc"):
+            for item in list(_AUDIT_LOG)[-per_src:]:
+                entries.append(dict(item))
+        if src in ("all", "system"):
+            entries.extend(_read_windows_event_logs("System", "system", per_src))
+        if src in ("all", "application"):
+            entries.extend(_read_windows_event_logs("Application", "application", per_src))
+    else:
+        has_journal = bool(find_bin("journalctl"))
+        has_dmesg = bool(find_bin("dmesg"))
+        syslog_files = [
+            p for p in (
+                "/var/log/messages",
+                "/var/log/syslog",
+                "/var/log/socklog/everything/current",
+                "/var/log/everything/current",
+            )
+            if os.path.isfile(p)
+        ]
+        openrc_files = [p for p in ("/var/log/rc.log",) if os.path.isfile(p)]
 
-    if src in ("all", "journal") and has_journal:
-        jcmd = ["journalctl", "-n", str(per_src), "--no-pager", "-o", "short-iso"]
-        if lvl == "err":
-            jcmd.extend(["-p", "3"])
-        elif lvl == "warn":
-            jcmd.extend(["-p", "4"])
-        rc, out, _ = run_cmd(jcmd, timeout=6)
-        if rc == 0 and out:
-            for raw in out.splitlines():
-                if not raw.startswith("-- "):
-                    entries.append(_parse_log_line(raw, "journal"))
+        available_sources = ["mobile-rc"]
+        if has_journal:
+            available_sources.append("journal")
+        if openrc_files:
+            available_sources.append("openrc")
+        if syslog_files:
+            available_sources.append("syslog")
+        if has_dmesg:
+            available_sources.append("dmesg")
 
-    if src in ("all", "openrc") and openrc_files:
-        for path in openrc_files:
-            for raw in _read_tail_lines(path, max_lines=per_src):
-                entries.append(_parse_log_line(raw, "openrc"))
+        if src in ("all", "mobile-rc"):
+            for item in list(_AUDIT_LOG)[-per_src:]:
+                entries.append(dict(item))
+            if os.path.isfile("/var/log/mobile-rc.log"):
+                for raw in _read_tail_lines("/var/log/mobile-rc.log", max_lines=per_src):
+                    entries.append(_parse_log_line(raw, "mobile-rc"))
 
-    if src in ("all", "syslog") and syslog_files:
-        for path in syslog_files[:2]:
-            for raw in _read_tail_lines(path, max_lines=per_src):
-                entries.append(_parse_log_line(raw, "syslog"))
+        if src in ("all", "journal") and has_journal:
+            jcmd = ["journalctl", "-n", str(per_src), "--no-pager", "-o", "short-iso"]
+            if lvl == "err":
+                jcmd.extend(["-p", "3"])
+            elif lvl == "warn":
+                jcmd.extend(["-p", "4"])
+            rc, out, _ = run_cmd(jcmd, timeout=6)
+            if rc == 0 and out:
+                for raw in out.splitlines():
+                    if not raw.startswith("-- "):
+                        entries.append(_parse_log_line(raw, "journal"))
 
-    if src in ("all", "dmesg") and has_dmesg:
-        dcmd = ["dmesg", "-T"]
-        if lvl == "err":
-            dcmd.append("--level=emerg,alert,crit,err")
-        elif lvl == "warn":
-            dcmd.append("--level=emerg,alert,crit,err,warn")
-        rc, out, _ = run_cmd(dcmd, timeout=5)
-        if rc != 0:
-            rc, out, _ = run_cmd(["dmesg"], timeout=5)
-        if rc == 0 and out:
-            for raw in out.splitlines()[-per_src:]:
-                if raw.strip():
-                    entries.append(_parse_log_line(raw, "dmesg"))
+        if src in ("all", "openrc") and openrc_files:
+            for path in openrc_files:
+                for raw in _read_tail_lines(path, max_lines=per_src):
+                    entries.append(_parse_log_line(raw, "openrc"))
+
+        if src in ("all", "syslog") and syslog_files:
+            for path in syslog_files[:2]:
+                for raw in _read_tail_lines(path, max_lines=per_src):
+                    entries.append(_parse_log_line(raw, "syslog"))
+
+        if src in ("all", "dmesg") and has_dmesg:
+            dcmd = ["dmesg", "-T"]
+            if lvl == "err":
+                dcmd.append("--level=emerg,alert,crit,err")
+            elif lvl == "warn":
+                dcmd.append("--level=emerg,alert,crit,err,warn")
+            rc, out, _ = run_cmd(dcmd, timeout=5)
+            if rc != 0:
+                rc, out, _ = run_cmd(["dmesg"], timeout=5)
+            if rc == 0 and out:
+                for raw in out.splitlines()[-per_src:]:
+                    if raw.strip():
+                        entries.append(_parse_log_line(raw, "dmesg"))
 
     filtered = []
     for item in entries:
@@ -2100,8 +2774,54 @@ def _walk_lsblk_devices(nodes, out):
             _walk_lsblk_devices(node["children"], out)
 
 
+def _get_windows_distros_info(os_info, refresh=False):
+    cpu_model = os.environ.get("PROCESSOR_IDENTIFIER") or platform.processor() or "x86_64 CPU"
+    host = {
+        "name": os_info.get("name", "Windows"),
+        "hostname": os_info.get("hostname", ""),
+        "kernel": os_info.get("kernel", ""),
+        "arch": platform.machine(),
+        "init_system": "windows-svc",
+        "compositor": "DWM",
+        "cpu_model": cpu_model,
+        "gpu_name": get_gpu_info().get("name", "Integrated / Unknown"),
+    }
+    detected_distros = [{"name": host["name"], "source": "Running Host", "detail": f"windows-svc / {host['kernel']}"}]
+    if find_bin("wsl"):
+        rc, out, _ = run_cmd(["wsl", "-l", "-v"], timeout=5, encoding="utf-16-le")
+        if rc == 0 and out:
+            for line in out.splitlines()[1:]:
+                clean = line.replace("\x00", "").strip().lstrip("*").strip()
+                if not clean:
+                    continue
+                parts = clean.split()
+                if parts:
+                    detected_distros.append({
+                        "name": parts[0],
+                        "source": "WSL",
+                        "detail": " ".join(parts[1:]) if len(parts) > 1 else "Installed",
+                    })
+    filesystems = [
+        {"target": d["part"], "fstype": d["fstype"], "source": f"{d['size']} ({d['use_pct']} used)"}
+        for d in get_disks_info(refresh=refresh)
+    ]
+    return {
+        "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "deep_scan": False,
+        "cached": False,
+        "host": host,
+        "efi_entries": get_boot_entries(refresh=refresh),
+        "bootloader_entries": [],
+        "os_prober": [],
+        "filesystems": filesystems,
+        "unmounted_distros": [],
+        "detected_distros": detected_distros,
+        "scan_errors": [],
+    }
+
+
 def get_installed_distros_info(deep=False, refresh=False):
-    """Inventory running OS, bootloaders, os-prober, and optionally read-only unmounted partitions."""
+    """Inventory running OS, bootloaders, os-prober / WSL, and optionally read-only unmounted partitions."""
     global _DISTRO_CACHE
     cache_key = "deep" if deep else "safe"
     now = time.time()
@@ -2114,6 +2834,13 @@ def get_installed_distros_info(deep=False, refresh=False):
         return res
 
     os_info = get_os_info()
+    if IS_WINDOWS:
+        payload = _get_windows_distros_info(os_info, refresh=refresh)
+        cache_copy = dict(payload)
+        cache_copy["_ts"] = now
+        _DISTRO_CACHE[cache_key] = cache_copy
+        return payload
+
     cpu_model = ""
     try:
         with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
@@ -2136,7 +2863,7 @@ def get_installed_distros_info(deep=False, refresh=False):
         "gpu_name": get_gpu_info().get("name", "Integrated / Unknown"),
     }
 
-    efi_entries = get_boot_entries()
+    efi_entries = get_boot_entries(refresh=refresh)
     bootloader_entries = _scan_bootloader_configs()
     filesystems = _scan_mounted_filesystems()
 
@@ -2241,10 +2968,33 @@ def get_installed_distros_info(deep=False, refresh=False):
     return payload
 
 
-def get_services_info():
-    """Return host service list normalized across OpenRC, systemd, and runit."""
+def _compute_services_info():
+    """Return host service list normalized across OpenRC, systemd, runit, and Windows Services."""
     init_sys = detect_init_system()
     services = []
+    if IS_WINDOWS:
+        ps = (
+            "Get-Service | Sort-Object Status -Descending | Select-Object -First 80 "
+            "Name,@{N='Status';E={$_.Status.ToString()}},@{N='StartType';E={$_.StartType.ToString()}} | "
+            "ConvertTo-Json -Compress"
+        )
+        rc, out, _ = _win_run_ps(ps, timeout=6)
+        if rc == 0 and out:
+            try:
+                parsed = json.loads(out)
+                if isinstance(parsed, dict):
+                    parsed = [parsed]
+                for item in parsed:
+                    if isinstance(item, dict) and item.get("Name"):
+                        services.append({
+                            "name": str(item["Name"]),
+                            "status": str(item.get("Status") or "Unknown").lower(),
+                            "runlevel": str(item.get("StartType") or "windows"),
+                        })
+            except Exception:
+                pass
+        return {"init_system": init_sys, "services": services}
+
     if init_sys == "openrc" and find_bin("rc-status"):
         rc, out, _ = run_cmd(["rc-status", "-a", "-C"], timeout=6)
         runlevel = "default"
@@ -2290,16 +3040,30 @@ def get_services_info():
     return {"init_system": init_sys, "services": services}
 
 
+def get_services_info():
+    return _cached("services_info", 4.0, _compute_services_info)
+
+
 def control_service(name, action):
     """Safely start, stop, restart, or reload a system service under validated init tools."""
     svc = str(name or "").strip()
     act = str(action or "").strip().lower()
-    if not re.fullmatch(r"[A-Za-z0-9_.@:-]{1,96}", svc):
+    svc_pattern = r"[A-Za-z0-9_.@:$-]{1,96}" if IS_WINDOWS else r"[A-Za-z0-9_.@:-]{1,96}"
+    if not re.fullmatch(svc_pattern, svc):
         return False, "Invalid service name"
     if act not in ("start", "stop", "restart", "reload"):
         return False, "Invalid service action"
     init_sys = detect_init_system()
-    if init_sys == "openrc" and find_bin("rc-service"):
+    if IS_WINDOWS:
+        if act == "reload":
+            return False, "Reload is not supported on Windows services (use restart)"
+        verb = {"start": "Start-Service", "stop": "Stop-Service -Force", "restart": "Restart-Service -Force"}[act]
+        rc, out, err = _win_run_ps(
+            f"{verb} -Name $env:MRC_SVC_NAME -ErrorAction Stop",
+            timeout=20,
+            extra_env={"MRC_SVC_NAME": svc},
+        )
+    elif init_sys == "openrc" and find_bin("rc-service"):
         rc, out, err = run_cmd(["rc-service", svc, act], timeout=20)
     elif init_sys == "systemd" and find_bin("systemctl"):
         rc, out, err = run_cmd(["systemctl", act, svc], timeout=20)
@@ -2308,6 +3072,7 @@ def control_service(name, action):
         rc, out, err = run_cmd(["sv", sv_act, svc], timeout=15)
     else:
         return False, f"Service control not supported on init system '{init_sys}'"
+    _invalidate_cache("services_info")
     msg = (out or err or f"{svc} {act}: exit {rc}").strip()
     if rc == 0:
         record_audit_event("INFO", f"Service action: {svc} -> {act}")
@@ -2317,12 +3082,37 @@ def control_service(name, action):
 
 
 def get_processes_info(limit=30):
-    """Return top running processes sorted by CPU/RSS delta using /proc without external deps."""
+    """Return top running processes sorted by CPU/RSS delta using /proc or Windows tasklist."""
     global _PROC_LAST
     try:
         cap = max(5, min(60, int(limit)))
     except (TypeError, ValueError):
         cap = 30
+
+    if IS_WINDOWS:
+        items = []
+        rc, out, _ = run_cmd(["tasklist", "/FO", "CSV", "/NH"], timeout=6)
+        if rc == 0 and out:
+            for row in csv.reader(out.splitlines()):
+                if len(row) < 5:
+                    continue
+                name = row[0].strip()
+                try:
+                    pid = int(row[1].strip())
+                except ValueError:
+                    continue
+                mem_digits = re.sub(r"[^\d]", "", row[4])
+                rss_mb = round(int(mem_digits) / 1024.0, 1) if mem_digits else 0.0
+                items.append({
+                    "pid": pid,
+                    "name": name[:32],
+                    "cmd": name[:96],
+                    "state": "R",
+                    "cpu_pct": 0.0,
+                    "rss_mb": rss_mb,
+                })
+        items.sort(key=lambda p: p["rss_mb"], reverse=True)
+        return {"processes": items[:cap], "total": len(items)}
 
     total_ticks = 0
     try:
@@ -2391,12 +3181,24 @@ def kill_process(pid, sig_name="TERM"):
         pid_int = int(pid)
     except (TypeError, ValueError):
         return False, "Invalid PID"
-    if pid_int <= 1 or pid_int == os.getpid():
-        return False, "Refusing to signal init or Mobile-RC server process"
-    sig_map = {"TERM": 15, "KILL": 9, "HUP": 1}
+    min_protected = 4 if IS_WINDOWS else 1
+    if pid_int <= min_protected or pid_int == os.getpid():
+        return False, "Refusing to signal init/system or Mobile-RC server process"
     sig_key = str(sig_name or "TERM").strip().upper()
-    if sig_key not in sig_map:
+    if sig_key not in ("TERM", "KILL", "HUP"):
         return False, "Unsupported signal (use TERM, KILL, or HUP)"
+
+    if IS_WINDOWS:
+        cmd = ["taskkill", "/PID", str(pid_int)]
+        if sig_key == "KILL":
+            cmd.append("/F")
+        rc, out, err = run_cmd(cmd, timeout=8)
+        msg = (out or err or f"taskkill PID {pid_int}: exit {rc}").strip()
+        if rc == 0:
+            record_audit_event("WARN", f"Terminated Windows PID {pid_int} ({sig_key})")
+        return rc == 0, msg
+
+    sig_map = {"TERM": 15, "KILL": 9, "HUP": 1}
     try:
         os.kill(pid_int, sig_map[sig_key])
         record_audit_event("WARN", f"Sent SIG{sig_key} to PID {pid_int}")
@@ -2415,12 +3217,68 @@ _ALLOWED_REMOTE_KEYS = {
     "XF86AudioPlay", "XF86AudioRaiseVolume", "XF86AudioLowerVolume",
 }
 
+_WIN_VK_MAP = {
+    "Return": 0x0D, "BackSpace": 0x08, "Escape": 0x1B, "Tab": 0x09, "space": 0x20,
+    "Prior": 0x21, "Next": 0x22, "End": 0x23, "Home": 0x24,
+    "Left": 0x25, "Up": 0x26, "Right": 0x27, "Down": 0x28,
+    "XF86AudioPlay": 0xB3, "XF86AudioRaiseVolume": 0xAF, "XF86AudioLowerVolume": 0xAE,
+}
+
+
+def _send_windows_remote_input(kind, payload):
+    try:
+        user32 = ctypes.windll.user32
+        if kind == "move":
+            dx = max(-800, min(800, int(round(float(payload.get("dx", 0))))))
+            dy = max(-800, min(800, int(round(float(payload.get("dy", 0))))))
+
+            pt = _WinPoint()
+            user32.GetCursorPos(ctypes.byref(pt))
+            user32.SetCursorPos(pt.x + dx, pt.y + dy)
+            return True, "win32"
+
+        if kind == "click":
+            btn = str(payload.get("button", "left")).strip().lower()
+            flags = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010), "middle": (0x0020, 0x0040)}
+            if btn not in flags:
+                return False, "Unsupported mouse button"
+            down, up = flags[btn]
+            user32.mouse_event(down, 0, 0, 0, 0)
+            user32.mouse_event(up, 0, 0, 0, 0)
+            return True, "win32"
+
+        if kind == "scroll":
+            dy = max(-20, min(20, int(round(float(payload.get("dy", 0))))))
+            if dy == 0:
+                return True, "noop"
+            user32.mouse_event(0x0800, 0, 0, ctypes.c_ulong(-dy * 120), 0)
+            return True, "win32"
+
+        if kind == "key":
+            key = str(payload.get("key", "")).strip()
+            if key not in _WIN_VK_MAP:
+                return False, "Unsupported key"
+            _win_send_vk(_WIN_VK_MAP[key])
+            return True, "win32"
+
+        if kind == "text":
+            text = str(payload.get("text", ""))
+            if not text or len(text) > 1000:
+                return False, "Text must be 1-1000 characters"
+            return type_prompt_to_active_window(text, auto_enter=bool(payload.get("auto_enter", False)))
+        return False, "Unsupported remote input kind"
+    except Exception as e:
+        return False, str(e)
+
 
 def send_remote_input(kind, payload):
     """Dispatch mobile trackpad, click, scroll, whitelisted key, or text events to desktop."""
     kind = str(kind or "").strip().lower()
     if not isinstance(payload, dict):
         payload = {}
+    if IS_WINDOWS:
+        return _send_windows_remote_input(kind, payload)
+
     env = get_desktop_env()
     search_path = env["PATH"]
     has_ydo = bool(find_bin("ydotool", search_path))
@@ -2530,9 +3388,17 @@ def _discovery_worker():
             time.sleep(0.2)
 
 
-def get_local_ips():
+def _compute_local_ips():
     ips = []
-    if find_bin("ip"):
+    if IS_WINDOWS:
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip_addr = info[4][0]
+                if ip_addr and not ip_addr.startswith("127.") and ip_addr not in ips:
+                    ips.append(ip_addr)
+        except Exception:
+            pass
+    if not IS_WINDOWS and find_bin("ip"):
         try:
             rc, out, _ = run_cmd(["ip", "-4", "-o", "addr", "show", "scope", "global"])
             if rc == 0 and out:
@@ -2546,7 +3412,7 @@ def get_local_ips():
                                 ips.append(ip_addr)
         except Exception:
             pass
-    if not ips and find_bin("hostname"):
+    if not IS_WINDOWS and not ips and find_bin("hostname"):
         try:
             rc, out, _ = run_cmd(["hostname", "-I"])
             if rc == 0 and out:
@@ -2560,12 +3426,16 @@ def get_local_ips():
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip_addr = s.getsockname()[0]
-            if ip_addr not in ips:
+            if ip_addr and not ip_addr.startswith("127.") and ip_addr not in ips:
                 ips.append(ip_addr)
             s.close()
         except Exception:
             pass
     return ips
+
+
+def get_local_ips():
+    return _cached("local_ips", 15.0, _compute_local_ips)
 
 
 # === OPT-IN TUNNEL & NTFY HELPERS ===
@@ -2603,6 +3473,7 @@ def _ensure_ssh_keypair():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            creationflags=_win_creationflags(),
         )
     if os.path.exists(SSH_KEY_FILE):
         try:
@@ -2620,20 +3491,27 @@ def _tunnel_reader(proc):
             line = raw_line.strip()
             if not line:
                 continue
-            m = re.search(r"(https://[a-zA-Z0-9._-]+\.(?:lhr\.life|localhost\.run))", line)
+            m = re.search(
+                r"(https://(?!admin\.|www\.|docs\.)[a-zA-Z0-9._-]+\.(?:lhr\.life|localhost\.run))\b",
+                line,
+            )
             if m:
                 url = m.group(1)
+                changed = False
                 with _TUNNEL_LOCK:
                     if _TUNNEL_PROC is not proc:
                         return
-                    _TUNNEL_URL = url
+                    if _TUNNEL_URL != url:
+                        _TUNNEL_URL = url
+                        changed = True
                     _TUNNEL_STATUS = "online"
-                try:
-                    _ensure_config_dir()
-                    _write_secure_file(os.path.join(CONFIG_DIR, "tunnel_url.txt"), url + "\n", 0o600)
-                except Exception:
-                    pass
-                threading.Thread(target=_publish_ntfy, args=(url,), daemon=True).start()
+                if changed:
+                    try:
+                        _ensure_config_dir()
+                        _write_secure_file(os.path.join(CONFIG_DIR, "tunnel_url.txt"), url + "\n", 0o600)
+                    except Exception:
+                        pass
+                    threading.Thread(target=_publish_ntfy, args=(url,), daemon=True).start()
     except Exception:
         pass
     finally:
@@ -2680,6 +3558,7 @@ def start_tunnel():
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            creationflags=_win_creationflags(),
         )
         _TUNNEL_PROC = proc
         threading.Thread(target=_tunnel_reader, args=(proc,), daemon=True).start()
@@ -2744,6 +3623,89 @@ def _tunnel_watchdog():
             time.sleep(10)
 
 
+def capture_desktop_screenshot():
+    """Capture active desktop display into compressed JPEG (or PNG fallback) across Windows/Linux."""
+    _, uid, gid, _ = get_target_user_info()
+    with tempfile.TemporaryDirectory(prefix="mrc_shot_") as tmpdir:
+        try:
+            if not IS_WINDOWS and hasattr(os, "geteuid") and os.geteuid() == 0 and uid != 0:
+                os.chown(tmpdir, uid, gid)
+            os.chmod(tmpdir, 0o700)
+        except OSError:
+            pass
+        raw_path = os.path.join(tmpdir, "raw.png")
+        shot_path = os.path.join(tmpdir, "shot.jpg")
+
+        if IS_WINDOWS:
+            ps_script = (
+                "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
+                "$vs = [System.Windows.Forms.SystemInformation]::VirtualScreen; "
+                "$bmp = New-Object System.Drawing.Bitmap($vs.Width, $vs.Height); "
+                "$g = [System.Drawing.Graphics]::FromImage($bmp); "
+                "$g.CopyFromScreen($vs.Left, $vs.Top, 0, 0, $bmp.Size); "
+                "$scale = [Math]::Min(1.0, [Math]::Min(1280.0 / [Math]::Max(1, $bmp.Width), 800.0 / [Math]::Max(1, $bmp.Height))); "
+                "$tw = [Math]::Max(1, [int][Math]::Round($bmp.Width * $scale)); "
+                "$th = [Math]::Max(1, [int][Math]::Round($bmp.Height * $scale)); "
+                "$outBmp = New-Object System.Drawing.Bitmap($tw, $th); "
+                "$g2 = [System.Drawing.Graphics]::FromImage($outBmp); "
+                "$g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; "
+                "$g2.DrawImage($bmp, 0, 0, $tw, $th); "
+                "$enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1; "
+                "$ep = New-Object System.Drawing.Imaging.EncoderParameters(1); "
+                "$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, 75L); "
+                "$outBmp.Save($env:MRC_SHOT_PATH, $enc, $ep); "
+                "$g2.Dispose(); $outBmp.Dispose(); $g.Dispose(); $bmp.Dispose()"
+            )
+            rc, _, _ = _win_run_ps(ps_script, timeout=8, extra_env={"MRC_SHOT_PATH": shot_path})
+            if rc == 0 and os.path.isfile(shot_path) and os.path.getsize(shot_path) > 500:
+                with open(shot_path, "rb") as f:
+                    return f.read(), "image/jpeg"
+            return None, None
+
+        env = get_desktop_env()
+        comp = get_active_compositor(env)
+        capture_cmds = [
+            ["grim", raw_path],
+            ["wayshot", "-f", raw_path],
+            ["spectacle", "-b", "-n", "-o", raw_path],
+            ["gnome-screenshot", "-f", raw_path],
+            ["maim", raw_path],
+            ["scrot", raw_path],
+            ["import", "-window", "root", raw_path],
+        ]
+        if comp == "kde":
+            capture_cmds.insert(0, capture_cmds.pop(2))
+        elif comp == "gnome":
+            capture_cmds.insert(0, capture_cmds.pop(3))
+        for cmd in capture_cmds:
+            if not find_bin(cmd[0], env["PATH"]):
+                continue
+            rc, _, _ = run_as_user(cmd, timeout=8, shell=False)
+            if rc == 0 and os.path.isfile(raw_path) and os.path.getsize(raw_path) > 1000:
+                break
+
+        if os.path.isfile(raw_path) and os.path.getsize(raw_path) > 1000:
+            run_first_available([
+                ["magick", raw_path, "-resize", "1280x800", "-quality", "75", shot_path],
+                ["convert", raw_path, "-resize", "1280x800", "-quality", "75", shot_path],
+            ], timeout=8)
+            if os.path.isfile(shot_path) and os.path.getsize(shot_path) > 1000:
+                with open(shot_path, "rb") as f:
+                    return f.read(), "image/jpeg"
+            try:
+                from PIL import Image
+                with Image.open(raw_path) as im:
+                    rgb_im = im.convert("RGB")
+                    rgb_im.thumbnail((1280, 800))
+                    rgb_im.save(shot_path, "JPEG", quality=75)
+                with open(shot_path, "rb") as f:
+                    return f.read(), "image/jpeg"
+            except Exception:
+                with open(raw_path, "rb") as f:
+                    return f.read(), "image/png"
+    return None, None
+
+
 def _delayed_power(cmd_variants):
     """Run poweroff/reboot command after HTTP response flushes."""
     time.sleep(0.8)
@@ -2757,638 +3719,974 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<meta name="theme-color" content="#0b0f19">
-<title>Mobile-RC • Linux Control Center</title>
+<meta name="theme-color" content="#070b14">
+<title>Mobile-RC • Control Center</title>
 <style>
   :root {
-    --bg: #0b0f19;
-    --card: rgba(20, 27, 45, 0.85);
-    --border: rgba(255, 255, 255, 0.09);
+    --bg: #070b14;
+    --bg-elev: #0d1424;
+    --card: rgba(15, 23, 42, 0.88);
+    --card-inner: rgba(2, 6, 23, 0.48);
+    --border: rgba(148, 163, 184, 0.14);
+    --border-strong: rgba(148, 163, 184, 0.24);
     --accent: #38bdf8;
+    --accent-soft: rgba(56, 189, 248, 0.14);
     --accent2: #818cf8;
-    --text: #f1f5f9;
+    --text: #f8fafc;
     --muted: #94a3b8;
-    --danger: #f43f5e;
+    --danger: #ef4444;
     --success: #10b981;
     --warning: #f59e0b;
+    --radius: 16px;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Inter, sans-serif; -webkit-tap-highlight-color: transparent; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
-    background: radial-gradient(circle at top right, #1e1b4b, #0b0f19 60%);
+    background: radial-gradient(circle at 12% 8%, rgba(56,189,248,0.10), transparent 36%),
+                radial-gradient(circle at 88% 85%, rgba(129,140,248,0.08), transparent 38%),
+                var(--bg);
     color: var(--text);
     min-height: 100vh;
-    padding-bottom: 84px;
+    font-size: 14px;
+    line-height: 1.45;
   }
-  .container { max-width: 540px; margin: 0 auto; padding: 14px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .svg-ic { width: 18px; height: 18px; flex-shrink: 0; display: inline-block; vertical-align: middle; }
+  .svg-sm { width: 15px; height: 15px; flex-shrink: 0; display: inline-block; vertical-align: middle; }
+
+  .app-shell { display: flex; min-height: 100vh; width: 100%; }
+  .sidebar-rail {
+    display: none;
+    width: 224px;
+    flex-shrink: 0;
+    background: rgba(9, 14, 27, 0.96);
+    border-right: 1px solid var(--border);
+    padding: 18px 12px;
+    flex-direction: column;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    z-index: 30;
+  }
+  .sidebar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+  }
+  .brand-logo {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, rgba(56,189,248,0.22), rgba(129,140,248,0.22));
+    border: 1px solid rgba(56,189,248,0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--accent);
+  }
+  .sidebar-links { display: flex; flex-direction: column; gap: 4px; }
+  .sidebar-rail .nav-item {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 11px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid transparent;
+    width: 100%;
+    text-align: left;
+  }
+  .sidebar-rail .nav-item:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+  .sidebar-rail .nav-item.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-color: rgba(56,189,248,0.28);
+  }
+  .sidebar-footer { padding-top: 12px; border-top: 1px solid var(--border); }
+
+  .main-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .container { width: 100%; max-width: 1260px; margin: 0 auto; padding: 14px 14px 92px; }
+
+  @media (min-width: 768px) {
+    .sidebar-rail { display: flex; }
+    .bottom-nav { display: none !important; }
+    .container { padding: 20px 24px 32px; }
+  }
 
   .header {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 18px;
-    padding: 16px;
-    margin-bottom: 14px;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    backdrop-filter: blur(12px);
+    gap: 12px;
+    padding: 4px 2px 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
   }
   .os-badge {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    background: rgba(56, 189, 248, 0.15);
+    background: rgba(56,189,248,0.12);
     color: var(--accent);
+    border: 1px solid rgba(56,189,248,0.28);
     padding: 3px 10px;
-    border-radius: 20px;
+    border-radius: 999px;
     font-size: 11px;
     font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    margin-bottom: 6px;
+    letter-spacing: 0.2px;
   }
-  .dot { width: 7px; height: 7px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 8px var(--accent); }
-  .title { font-size: 19px; font-weight: 800; letter-spacing: -0.3px; }
-  .subtitle { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 8px var(--success);
+    display: inline-block;
+  }
+  .title { font-size: 20px; font-weight: 800; letter-spacing: -0.35px; margin-top: 4px; }
+  .subtitle { font-size: 12px; color: var(--muted); }
 
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
   .card {
     background: var(--card);
     border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 14px;
-    margin-bottom: 12px;
-    backdrop-filter: blur(12px);
+    border-radius: var(--radius);
+    padding: 15px;
+    margin-bottom: 14px;
+    box-shadow: 0 10px 30px rgba(2, 6, 23, 0.35);
+    min-width: 0;
   }
   .card-title {
-    font-size: 13px;
-    font-weight: 700;
-    color: var(--muted);
+    font-size: 12px;
     text-transform: uppercase;
-    letter-spacing: 0.6px;
+    letter-spacing: 0.7px;
+    color: var(--muted);
+    font-weight: 700;
     margin-bottom: 12px;
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
   }
+  .card-title-left { display: inline-flex; align-items: center; gap: 7px; color: #cbd5e1; }
+
+  .bento-metrics {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+  @media (min-width: 1024px) {
+    .bento-metrics { grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  }
+  .bento-2col { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  @media (min-width: 1024px) {
+    .bento-2col { grid-template-columns: 1.35fr 1fr; align-items: start; }
+  }
+  .bento-pair { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  @media (min-width: 900px) {
+    .bento-pair { grid-template-columns: repeat(2, 1fr); align-items: start; }
+  }
+
+  .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 9px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; }
 
   .stat-box {
-    background: rgba(15, 23, 42, 0.7);
+    background: var(--card);
     border: 1px solid var(--border);
+    padding: 13px;
     border-radius: 14px;
-    padding: 12px;
+    min-width: 0;
   }
-  .stat-label { font-size: 11px; color: var(--muted); font-weight: 600; margin-bottom: 4px; }
+  .stat-label { font-size: 11px; color: var(--muted); font-weight: 700; letter-spacing: 0.4px; }
+  .stat-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin: 4px 0 6px; }
   .stat-val { font-size: 20px; font-weight: 800; color: var(--text); }
-  .bar-bg { background: rgba(255, 255, 255, 0.08); height: 6px; border-radius: 3px; overflow: hidden; margin-top: 6px; }
-  .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 3px; transition: width 0.4s ease; }
+  .bar-bg { height: 5px; background: rgba(255,255,255,0.07); border-radius: 99px; overflow: hidden; }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 99px; transition: width 0.35s ease; }
+  .spark-wrap { width: 100%; height: 28px; margin-top: 7px; opacity: 0.92; }
+  .spark-wrap svg { width: 100%; height: 100%; display: block; }
 
-  .shot-wrap {
-    position: relative;
-    border-radius: 12px;
-    overflow: hidden;
-    background: #000;
-    margin-bottom: 10px;
-    border: 1px solid var(--border);
-    aspect-ratio: 16/10;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-  }
-  .shot-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }
-  .shot-placeholder { font-size: 12px; color: var(--muted); padding: 12px; text-align: center; }
-
-  button, .btn {
-    appearance: none;
-    background: rgba(255, 255, 255, 0.08);
+  button {
+    background: rgba(255,255,255,0.055);
     color: var(--text);
     border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 11px 14px;
+    border-radius: 11px;
+    padding: 10px 12px;
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;
+    transition: background 0.14s ease, border-color 0.14s ease, transform 0.1s ease;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 6px;
-    transition: all 0.15s ease;
-    text-decoration: none;
   }
-  button:active, .btn:active { transform: scale(0.97); background: rgba(255, 255, 255, 0.14); }
-  .btn-primary { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; border: none; font-weight: 700; }
-  .btn-danger { background: rgba(244, 63, 94, 0.15); color: var(--danger); border-color: rgba(244, 63, 94, 0.3); }
-  .btn-success { background: rgba(16, 185, 129, 0.15); color: var(--success); border-color: rgba(16, 185, 129, 0.3); }
+  button:hover { background: rgba(255,255,255,0.09); border-color: var(--border-strong); }
+  button:active { transform: scale(0.97); }
+  button:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn-sm { padding: 5px 10px; font-size: 11px; border-radius: 8px; }
+  .btn-primary { background: linear-gradient(135deg, #0ea5e9, #6366f1); border-color: transparent; color: #fff; }
+  .btn-primary:hover { filter: brightness(1.08); background: linear-gradient(135deg, #0ea5e9, #6366f1); }
+  .btn-danger { background: rgba(239,68,68,0.14); border-color: rgba(239,68,68,0.34); color: #fca5a5; }
+  .btn-danger:hover { background: rgba(239,68,68,0.24); }
+  .btn-success { background: rgba(16,185,129,0.14); border-color: rgba(16,185,129,0.34); color: #6ee7b7; }
+  .btn-warn { background: rgba(245,158,11,0.14); border-color: rgba(245,158,11,0.35); color: #fcd34d; }
 
-  .btn-os { background: rgba(56, 189, 248, 0.12); border-color: rgba(56, 189, 248, 0.3); color: var(--accent); }
-  .btn-arch { background: rgba(23, 147, 209, 0.15); border-color: rgba(23, 147, 209, 0.4); color: #38bdf8; }
-  .btn-cachyos { background: rgba(0, 212, 170, 0.14); border-color: rgba(0, 212, 170, 0.42); color: #2dd4bf; }
-  .btn-garuda { background: rgba(240, 98, 146, 0.15); border-color: rgba(240, 98, 146, 0.4); color: #f472b6; }
-  .btn-gentoo { background: rgba(168, 85, 247, 0.15); border-color: rgba(168, 85, 247, 0.4); color: #c084fc; }
-  .btn-nixos { background: rgba(126, 186, 228, 0.14); border-color: rgba(126, 186, 228, 0.42); color: #7ebae4; }
+  .btn-os { justify-content: space-between; padding: 13px 14px; font-size: 13px; text-align: left; }
+  .btn-arch { border-color: rgba(23,147,209,0.45); background: rgba(23,147,209,0.12); color: #7dd3fc; }
+  .btn-cachyos { border-color: rgba(20,184,166,0.45); background: rgba(20,184,166,0.12); color: #5eead4; }
+  .btn-garuda { border-color: rgba(245,158,11,0.45); background: rgba(245,158,11,0.12); color: #fcd34d; }
+  .btn-gentoo { border-color: rgba(168,85,247,0.45); background: rgba(168,85,247,0.12); color: #d8b4fe; }
+  .btn-nixos { border-color: rgba(96,165,250,0.45); background: rgba(96,165,250,0.12); color: #93c5fd; }
 
-  input[type="range"] {
-    width: 100%;
-    accent-color: var(--accent);
-    margin: 10px 0;
-  }
-  input[type="text"], input[type="password"] {
-    width: 100%;
-    background: rgba(15, 23, 42, 0.8);
-    border: 1px solid var(--border);
+  .shot-wrap {
+    position: relative;
+    background: #020617;
     border-radius: 12px;
-    color: #fff;
-    padding: 10px 14px;
-    font-size: 13px;
-    outline: none;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    min-height: 200px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
   }
-  input[type="text"]:focus, input[type="password"]:focus { border-color: var(--accent); }
+  .shot-wrap img { width: 100%; height: auto; display: block; object-fit: contain; max-height: 430px; }
+  .shot-placeholder { color: var(--muted); font-size: 12px; padding: 28px; text-align: center; }
 
-  .file-item {
+  input[type="range"] { width: 100%; accent-color: var(--accent); height: 6px; margin: 10px 0; background: transparent; cursor: pointer; }
+  input[type="text"], input[type="email"], input[type="password"], select, textarea {
+    width: 100%;
+    background: rgba(2, 6, 23, 0.72);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 12px;
+    border-radius: 10px;
+    outline: none;
+    font-size: 13px;
+  }
+  select.compact-sel { width: auto; padding: 4px 8px; font-size: 11px; border-radius: 8px; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+
+  .badge-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    background: rgba(148,163,184,0.13);
+    color: #cbd5e1;
+    border: 1px solid var(--border);
+  }
+  .pill-ok { background: rgba(16,185,129,0.14); color: #6ee7b7; border-color: rgba(16,185,129,0.3); }
+  .pill-err { background: rgba(239,68,68,0.14); color: #fca5a5; border-color: rgba(239,68,68,0.3); }
+  .pill-warn { background: rgba(245,158,11,0.14); color: #fcd34d; border-color: rgba(245,158,11,0.3); }
+
+  .row-item {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 8px 10px;
-    background: rgba(255, 255, 255, 0.03);
+    gap: 10px;
+    padding: 9px 10px;
+    background: var(--card-inner);
+    border: 1px solid rgba(148,163,184,0.08);
     border-radius: 10px;
     margin-bottom: 6px;
-    font-size: 13px;
   }
-  .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 65%; }
+  .row-item-col { min-width: 0; flex: 1; }
+  .row-title { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-sub { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .scroll-box {
+    max-height: 360px;
+    overflow-y: auto;
+    background: rgba(2, 6, 23, 0.52);
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    padding: 6px;
+  }
+  .log-line {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    padding: 5px 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    word-break: break-word;
+  }
+  .log-err { color: #fca5a5; background: rgba(239,68,68,0.08); }
+  .log-warn { color: #fde68a; background: rgba(245,158,11,0.07); }
+  .log-info { color: #cbd5e1; }
+
+  .touchpad-box {
+    background: linear-gradient(180deg, rgba(15,23,42,0.9), rgba(2,6,23,0.95));
+    border: 1px dashed rgba(56,189,248,0.38);
+    border-radius: 14px;
+    height: 160px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    touch-action: none;
+    user-select: none;
+    cursor: crosshair;
+    margin-bottom: 9px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .term {
+    background: #020617;
+    border: 1px solid var(--border);
+    padding: 10px;
+    border-radius: 10px;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: #93c5fd;
+    max-height: 185px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin-top: 8px;
+  }
+
+  .tab-pane { display: none; animation: fadeIn 0.16s ease; }
+  .tab-pane.active { display: block; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
   .bottom-nav {
     position: fixed;
     bottom: 0;
     left: 0;
     right: 0;
-    background: rgba(11, 15, 25, 0.95);
+    background: rgba(7, 11, 20, 0.94);
+    backdrop-filter: blur(14px);
     border-top: 1px solid var(--border);
-    display: flex;
-    justify-content: space-around;
-    padding: 8px 6px;
-    backdrop-filter: blur(16px);
-    z-index: 100;
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
+    z-index: 40;
   }
-  .nav-item {
+  .bottom-nav .nav-item {
     background: transparent;
     border: none;
     color: var(--muted);
-    font-size: 10px;
-    font-weight: 700;
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 3px;
-    padding: 6px 4px;
-    flex: 1;
-    min-width: 0;
-    border-radius: 10px;
-  }
-  .badge-pill {
-    display: inline-block;
-    padding: 2px 7px;
-    border-radius: 999px;
+    padding: 5px 2px;
     font-size: 10px;
-    font-weight: 700;
-    background: rgba(56,189,248,0.16);
-    color: var(--accent);
-    border: 1px solid rgba(56,189,248,0.35);
+    font-weight: 600;
+    border-radius: 9px;
   }
-  .log-line {
-    padding: 6px 8px;
-    border-bottom: 1px solid rgba(255,255,255,0.06);
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
-    line-height: 1.45;
-    word-break: break-word;
-  }
-  .log-err { color: #fca5a5; }
-  .log-warn { color: #fde68a; }
-  .log-info { color: #e2e8f0; }
-  textarea, select {
-    width: 100%;
-    background: rgba(0,0,0,0.28);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 10px 12px;
-    font-size: 13px;
-    font-family: inherit;
-    resize: vertical;
-  }
-  .nav-item.active { color: var(--accent); }
-  .tab-pane { display: none; }
-  .tab-pane.active { display: block; animation: fadeIn 0.2s ease; }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  .bottom-nav .nav-item.active { color: var(--accent); background: rgba(56,189,248,0.1); }
 
   #toast {
     position: fixed;
     top: 16px;
     left: 50%;
-    transform: translateX(-50%);
-    background: rgba(15, 23, 42, 0.95);
+    transform: translateX(-50%) translateY(-85px);
+    background: #0f172a;
     border: 1px solid var(--accent);
     color: #fff;
     padding: 9px 18px;
-    border-radius: 30px;
+    border-radius: 999px;
     font-size: 12px;
-    font-weight: 700;
-    display: none;
-    z-index: 1200;
-    box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-  }
-  pre.term {
-    background: #020617;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 10px;
-    font-size: 11px;
-    color: #38bdf8;
-    max-height: 180px;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    margin-top: 10px;
-  }
-
-  /* Authentication Overlay */
-  #login-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(11, 15, 25, 0.96);
-    backdrop-filter: blur(16px);
-    z-index: 1100;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 20px;
-  }
-  .login-card {
-    width: 100%;
-    max-width: 380px;
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 24px;
+    font-weight: 600;
+    z-index: 120;
+    transition: transform 0.25s ease;
+    box-shadow: 0 12px 30px rgba(0,0,0,0.6);
+    pointer-events: none;
+    max-width: 90vw;
     text-align: center;
   }
-  .login-err {
-    color: var(--danger);
-    font-size: 12px;
-    min-height: 18px;
-    margin: 10px 0 6px;
+  #toast.show { transform: translateX(-50%) translateY(0); }
+
+  .overlay-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(4, 7, 15, 0.92);
+    backdrop-filter: blur(14px);
+    z-index: 100;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
   }
+  .modal-card {
+    width: 100%;
+    max-width: 390px;
+    background: #0f172a;
+    border: 1px solid var(--border-strong);
+    border-radius: 20px;
+    padding: 22px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.7);
+  }
+  .shot-modal-inner {
+    width: 100%;
+    max-width: 1120px;
+    max-height: 92vh;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .shot-modal-inner img {
+    width: 100%;
+    max-height: 82vh;
+    object-fit: contain;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: #020617;
+  }
+  .login-err { color: #fca5a5; font-size: 12px; min-height: 18px; margin: 8px 0 6px; text-align: center; }
 </style>
 </head>
 <body>
 
 <div id="toast"></div>
 
-<div id="login-overlay">
-  <div class="login-card">
+<div id="login-overlay" class="overlay-modal">
+  <div class="modal-card" style="text-align:center">
     <div class="os-badge" style="margin-bottom:10px"><span class="dot"></span> <span id="login-badge-text">Mobile-RC Locked</span></div>
     <div class="title" style="margin-bottom:6px">Enter Access Code</div>
-    <div class="subtitle" id="login-hint" style="margin-bottom:14px">Run <code>sudo control-access</code> on your PC/Laptop and enter the 6-digit RAC below (or run <code>control-access</code> in Termux).</div>
+    <div class="subtitle" id="login-hint" style="margin-bottom:14px">Run <code>sudo control-access</code> on your PC/Laptop and enter the 6-digit RAC below.</div>
     <div id="email-otp-box" style="display:none;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)">
-      <input type="email" id="email-input" placeholder="Registered email address" autocomplete="email" style="margin-bottom:8px" onkeydown="if(event.key==='Enter')requestEmailCode()">
-      <button id="send-email-btn" onclick="requestEmailCode()" style="width:100%;margin-bottom:6px">📧 Send Code to Email</button>
+      <input type="email" id="email-input" placeholder="Registered email address" autocomplete="email" style="margin-bottom:8px" onkeydown="handleEmailKey(event)">
+      <button id="send-email-btn" onclick="requestEmailCode()" style="width:100%;margin-bottom:6px">Send Code to Email</button>
       <div id="email-otp-status" class="subtitle" style="min-height:16px"></div>
     </div>
-    <input type="password" id="pin-input" inputmode="numeric" maxlength="16" placeholder="6-digit RAC" autocomplete="one-time-code" style="text-align:center;font-size:18px;letter-spacing:4px;margin-bottom:8px" oninput="onPinInput(this)" onkeydown="if(event.key==='Enter')submitLogin()">
+    <input type="password" id="pin-input" inputmode="numeric" maxlength="16" placeholder="6-digit RAC" autocomplete="one-time-code" style="text-align:center;font-size:18px;letter-spacing:4px;margin-bottom:6px" oninput="onPinInput(this)" onkeydown="handlePinKey(event)">
     <div class="login-err" id="login-err"></div>
-    <button class="btn-primary" style="width:100%" onclick="submitLogin()">🔓 Unlock Dashboard</button>
+    <button class="btn-primary" style="width:100%" onclick="submitLogin()">Unlock Dashboard</button>
   </div>
 </div>
 
-<div class="container">
-  <!-- HEADER -->
-  <div class="header">
+<div id="power-modal" class="overlay-modal">
+  <div class="modal-card">
+    <div class="title" id="power-modal-title" style="font-size:17px;margin-top:0">Confirm Action</div>
+    <div class="subtitle" id="power-modal-msg" style="margin:8px 0 18px;font-size:13px;line-height:1.5">Are you sure?</div>
+    <div class="grid-2">
+      <button onclick="closePowerModal()">Cancel</button>
+      <button id="power-modal-confirm" class="btn-danger" onclick="execPowerConfirm()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="shot-modal" class="overlay-modal" onclick="closeShotModal()">
+  <div class="shot-modal-inner" onclick="stopModalBubble(event)">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <span class="os-badge"><span class="dot"></span> Fullscreen Live Desktop</span>
+      <div style="display:flex;gap:8px">
+        <button class="btn-sm" onclick="refreshScreenshot(false)">Refresh Frame</button>
+        <button class="btn-sm btn-danger" onclick="closeShotModal()">Close</button>
+      </div>
+    </div>
+    <img id="shot-modal-img" alt="Fullscreen Desktop View">
+  </div>
+</div>
+
+<div class="app-shell">
+  <aside class="sidebar-rail">
     <div>
-      <div class="os-badge" id="os-badge"><span class="dot"></span> <span id="os-name">Loading...</span></div>
-      <div class="title" id="hostname">Mobile-RC</div>
-      <div class="subtitle" id="kernel-uptime">Kernel - • Uptime -</div>
-    </div>
-    <div style="text-align:right">
-      <div style="font-size:22px;font-weight:800" id="bat-top">--</div>
-      <div class="subtitle" id="bat-status">Power</div>
-      <button id="logout-btn" onclick="doLogout()" style="margin-top:6px;padding:4px 9px;font-size:11px">🔒 Lock</button>
-    </div>
-  </div>
-
-  <!-- TAB 1: MONITOR & SCREEN -->
-  <div id="tab-monitor" class="tab-pane active">
-    <div class="grid-2" style="margin-bottom:14px">
-      <div class="stat-box">
-        <div class="stat-label">CPU LOAD</div>
-        <div class="stat-val" id="cpu-val">0%</div>
-        <div class="bar-bg"><div class="bar-fill" id="cpu-bar" style="width:0%"></div></div>
-      </div>
-      <div class="stat-box">
-        <div class="stat-label">CPU TEMPERATURE</div>
-        <div class="stat-val" id="temp-val">0°C</div>
-        <div class="bar-bg"><div class="bar-fill" id="temp-bar" style="width:0%"></div></div>
-      </div>
-      <div class="stat-box">
-        <div class="stat-label">RAM USAGE</div>
-        <div class="stat-val" id="ram-val">0 GB</div>
-        <div class="bar-bg"><div class="bar-fill" id="ram-bar" style="width:0%"></div></div>
-      </div>
-      <div class="stat-box" id="stat-power-card">
-        <div class="stat-label" id="bat-label">POWER / GPU</div>
-        <div class="stat-val" id="bat-val">--</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:3px" id="bat-sub">Swap: -- | Net: --</div>
-        <div class="bar-bg"><div class="bar-fill" id="bat-bar" style="width:0%"></div></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        <span>🖥️ Live Desktop Screen Preview</span>
-        <div style="display:flex;gap:6px;align-items:center">
-          <button id="live-btn" onclick="toggleLiveMonitor()" style="padding:5px 10px;font-size:11px;border-color:rgba(16,185,129,0.5);color:var(--success)">● Live ON</button>
-          <button onclick="refreshScreenshot()" style="padding:5px 10px;font-size:11px">📸 Refresh</button>
+      <div class="sidebar-brand">
+        <div class="brand-logo">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        </div>
+        <div>
+          <div style="font-weight:800;font-size:14px;letter-spacing:-0.2px">Mobile-RC</div>
+          <div style="font-size:11px;color:var(--muted)" id="side-os-badge">Control Center</div>
         </div>
       </div>
-      <div class="shot-wrap" onclick="refreshScreenshot()">
-        <span class="shot-placeholder" id="shot-placeholder">Loading live desktop screen...</span>
-        <img id="live-shot" alt="Live desktop screen" style="display:none">
-      </div>
-      <div id="ws-list" class="grid-4" style="margin-bottom:8px"></div>
-      <div class="grid-3">
-        <button onclick="doAction('hypr', 'fullscreen')">⛶ Fullscreen</button>
-        <button onclick="doAction('hypr', 'dpms_toggle')">💡 Screen On/Off</button>
-        <button class="btn-danger" onclick="doAction('hypr', 'killactive')">✖ Close App</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title"><span>💾 Disk Partitions & Storage</span></div>
-      <div id="disk-list"></div>
-    </div>
-  </div>
-
-  <!-- TAB 2: MEDIA, VOLUME & DISPLAY -->
-  <div id="tab-media" class="tab-pane">
-    <div class="card">
-      <div class="card-title"><span>🎵 Now Playing</span> <span id="media-st" style="color:var(--accent)">-</span></div>
-      <div style="font-size:16px;font-weight:700;margin-bottom:14px" id="media-title">-</div>
-      <div class="grid-3">
-        <button onclick="doMedia('prev')">⏮ Prev</button>
-        <button class="btn-primary" onclick="doMedia('play-pause')">⏯ Play/Pause</button>
-        <button onclick="doMedia('next')">⏭ Next</button>
+      <div class="sidebar-links">
+        <button class="nav-item active" data-tab="monitor" onclick="switchTab('monitor', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 3 5-6"/></svg>
+          <span>Monitor</span>
+        </button>
+        <button class="nav-item" data-tab="media" onclick="switchTab('media', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="17.5" r="2.5"/><circle cx="17.5" cy="15.5" r="2.5"/><path d="M8 17.5V6l12-2v11.5"/></svg>
+          <span>Media &amp; Display</span>
+        </button>
+        <button class="nav-item" data-tab="boot" onclick="switchTab('boot', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+          <span>Boot &amp; Power</span>
+        </button>
+        <button class="nav-item" data-tab="remote" onclick="switchTab('remote', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/></svg>
+          <span>Remote &amp; Shell</span>
+        </button>
+        <button class="nav-item" data-tab="logs" onclick="switchTab('logs', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="14" y2="13"/><line x1="7" y1="17" x2="11" y2="17"/></svg>
+          <span>System &amp; Procs</span>
+        </button>
+        <button class="nav-item" data-tab="network" onclick="switchTab('network', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="3.6" y1="9" x2="20.4" y2="9"/><line x1="3.6" y1="15" x2="20.4" y2="15"/><path d="M12 3a14.5 14.5 0 0 0 0 18 14.5 14.5 0 0 0 0-18"/></svg>
+          <span>Network &amp; Files</span>
+        </button>
       </div>
     </div>
-
-    <div class="card">
-      <div class="card-title">
-        <span>🔊 Audio Volume</span>
-        <span id="vol-label" style="color:var(--accent);font-weight:800">50%</span>
-      </div>
-      <input type="range" id="vol-slider" min="0" max="150" value="50" onchange="doMedia('vol_set', this.value)" oninput="document.getElementById('vol-label').innerText=this.value+'%'">
-      <div class="grid-3">
-        <button onclick="doMedia('vol_down')">🔉 -5%</button>
-        <button onclick="doMedia('mute')">🔇 Mute</button>
-        <button onclick="doMedia('vol_up')">🔊 +5%</button>
-      </div>
+    <div class="sidebar-footer">
+      <button class="btn-danger" style="width:100%" onclick="doLogout()">
+        <svg class="svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        <span>Lock Session</span>
+      </button>
     </div>
+  </aside>
 
-    <div class="card">
-      <div class="card-title">
-        <span>☀️ Display Brightness</span>
-        <span id="bright-label" style="color:var(--warning);font-weight:800">50%</span>
-      </div>
-      <input type="range" id="bright-slider" min="5" max="100" value="50" onchange="doMedia('bright_set', this.value)" oninput="document.getElementById('bright-label').innerText=this.value+'%'">
-      <div class="grid-2">
-        <button onclick="doMedia('bright_down')">🔅 Dim (-10%)</button>
-        <button onclick="doMedia('bright_up')">🔆 Brighten (+10%)</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- TAB 3: MULTI-BOOT & POWER -->
-  <div id="tab-boot" class="tab-pane">
-    <div class="card">
-      <div class="card-title">
-        <span>Installed Distros &amp; Host Inventory</span>
-        <div style="display:flex;gap:6px;flex-wrap:wrap">
-          <button onclick="loadDistros(false, true)" style="padding:4px 10px;font-size:11px">Refresh</button>
-          <button onclick="loadDistros(true, true)" id="btn-deep-scan" style="padding:4px 10px;font-size:11px;border-color:rgba(56,189,248,0.45)">Scan Unmounted Partitions</button>
+  <div class="main-wrap">
+    <div class="container">
+      <div class="header">
+        <div>
+          <div class="os-badge" id="os-badge"><span class="dot"></span> <span id="os-name">Loading...</span></div>
+          <div class="title" id="hostname">Mobile-RC</div>
+          <div class="subtitle num" id="kernel-uptime">Kernel - | Uptime -</div>
+        </div>
+        <div style="text-align:right">
+          <div class="num" style="font-size:20px;font-weight:800" id="bat-top">--</div>
+          <div class="subtitle" id="bat-status">Power</div>
+          <button id="logout-btn" onclick="doLogout()" class="btn-sm" style="margin-top:6px">Lock</button>
         </div>
       </div>
-      <div id="distro-host-summary" style="font-size:12px;color:var(--muted);margin-bottom:10px">Loading host environment...</div>
-      <div id="distro-list" style="display:flex;flex-direction:column;gap:8px"></div>
-    </div>
-    <div class="card">
-      <div class="card-title"><span>🚀 Multi-Boot OS Switcher (UEFI BootNext)</span></div>
-      <div id="boot-list" style="display:flex;flex-direction:column;gap:10px">
-        <div style="color:var(--muted);font-size:13px">Scanning UEFI boot entries...</div>
-      </div>
-    </div>
 
-    <div class="card">
-      <div class="card-title"><span>⚡ Power & Session Controls</span></div>
-      <div class="grid-2">
-        <button onclick="doPower('lock')">🔒 Lock Screen</button>
-        <button onclick="doPower('suspend')">🌙 Sleep / Suspend</button>
-        <button class="btn-primary" onclick="confirmBoot('reboot', 'Reboot Current System')">🔄 Reboot</button>
-        <button class="btn-danger" onclick="confirmBoot('poweroff', 'Shutdown System')">⏻ Shutdown</button>
-      </div>
-    </div>
-  </div>
+      <!-- TAB 1: MONITOR -->
+      <div id="tab-monitor" class="tab-pane active">
+        <div class="bento-metrics">
+          <div class="stat-box">
+            <div class="stat-label">CPU LOAD</div>
+            <div class="stat-row"><span class="stat-val num" id="cpu-val">0%</span><span class="badge-pill num" id="cpu-peak">Peak 0%</span></div>
+            <div class="bar-bg"><div class="bar-fill" id="cpu-bar" style="width:0%"></div></div>
+            <div class="spark-wrap" id="cpu-spark"></div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">TEMPERATURE</div>
+            <div class="stat-row"><span class="stat-val num" id="temp-val">0°C</span><span class="badge-pill" id="temp-sub">Thermal</span></div>
+            <div class="bar-bg"><div class="bar-fill" id="temp-bar" style="width:0%"></div></div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">MEMORY (RAM)</div>
+            <div class="stat-row"><span class="stat-val num" id="ram-val">0 GB</span><span class="badge-pill num" id="ram-pct">0%</span></div>
+            <div class="bar-bg"><div class="bar-fill" id="ram-bar" style="width:0%"></div></div>
+          </div>
+          <div class="stat-box" id="stat-power-card">
+            <div class="stat-label" id="bat-label">POWER / GPU</div>
+            <div class="stat-row"><span class="stat-val num" id="bat-val">--</span></div>
+            <div class="subtitle num" style="font-size:11px;margin-bottom:5px" id="bat-sub">Swap: -- | Net: --</div>
+            <div class="bar-bg"><div class="bar-fill" id="bat-bar" style="width:0%"></div></div>
+            <div class="spark-wrap" id="net-spark"></div>
+          </div>
+        </div>
 
-  <!-- TAB 4: REMOTE APPS, MESSAGES & TERMINAL -->
-  <div id="tab-remote" class="tab-pane">
-    <div class="card">
-      <div class="card-title"><span>💬 Send Notification / Clipboard to PC</span></div>
-      <input type="text" id="msg-input" placeholder="Type message, text snippet, or URL..." style="margin-bottom:10px">
-      <div class="grid-3">
-        <button class="btn-primary" onclick="sendInput('notify')">🔔 Notify</button>
-        <button onclick="sendInput('clipboard')">📋 Copy to PC</button>
-        <button onclick="sendInput('open_url')">🌐 Open URL</button>
-      </div>
-    </div>
+        <div class="bento-2col">
+          <div class="card">
+            <div class="card-title">
+              <span class="card-title-left">
+                <svg class="svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                <span>Live Desktop Screen</span>
+              </span>
+              <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <select id="live-interval" class="compact-sel" onchange="changeLiveInterval(this.value)">
+                  <option value="0">Off</option>
+                  <option value="1000">1s</option>
+                  <option value="2000" selected>2s</option>
+                  <option value="5000">5s</option>
+                </select>
+                <button id="live-btn" class="btn-sm" onclick="toggleLiveMonitor()">Live ON</button>
+                <button class="btn-sm" onclick="refreshScreenshot(false)">Refresh</button>
+                <button class="btn-sm" onclick="openShotModal()">Expand</button>
+              </div>
+            </div>
+            <div class="shot-wrap" onclick="openShotModal()">
+              <span class="shot-placeholder" id="shot-placeholder">Loading live desktop screen...</span>
+              <img id="live-shot" style="display:none" alt="Live Desktop View">
+            </div>
+            <div class="grid-3" style="margin-top:10px">
+              <button class="btn-sm" onclick="doAction('hypr', 'fullscreen')">Fullscreen</button>
+              <button class="btn-sm" onclick="doAction('hypr', 'dpms_toggle')">Display Sleep</button>
+              <button class="btn-sm btn-danger" onclick="doAction('hypr', 'killactive')">Close Active</button>
+            </div>
+          </div>
 
-    <div class="card">
-      <div class="card-title"><span>🚀 Quick Application Launcher</span></div>
-      <div class="grid-2">
-        <button onclick="doAction('launch', 'terminal')">💻 Open Terminal</button>
-        <button onclick="doAction('launch', 'youtube')">▶️ Open YouTube</button>
-        <button onclick="doAction('launch', 'files')">📁 File Manager</button>
-        <button onclick="doAction('launch', 'btop')">📊 Open Btop Monitor</button>
-      </div>
-    </div>
+          <div>
+            <div class="card">
+              <div class="card-title">
+                <span class="card-title-left">
+                  <svg class="svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
+                  <span>Workspaces</span>
+                </span>
+              </div>
+              <div class="grid-4" id="ws-list"></div>
+            </div>
 
-    <div class="card">
-      <div class="card-title"><span>⌨️ Quick Web Terminal</span></div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-        <input type="text" id="cmd-input" style="flex:1;min-width:180px" placeholder="Example: fastfetch, df -h, sensors, or chat prompt..." onkeydown="if(event.key==='Enter')runTerminal('shell')">
-        <button class="btn-primary" onclick="runTerminal('shell')">Run Silent</button>
-        <button onclick="runTerminal('shell_gui')" style="border-color:rgba(56,189,248,0.45)">Open on Screen</button>
-        <button onclick="runTerminal('shell_type')">Type to Active</button>
-      </div>
-      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-bottom:8px;cursor:pointer">
-        <input type="checkbox" id="cmd-auto-enter" checked style="width:auto">
-        <span>Auto-Enter when typing into active desktop window (uncheck to preview before pressing Enter)</span>
-      </label>
-      <pre class="term" id="term-out">Ready to execute commands or send prompts to your Linux host...</pre>
-    </div>
-  </div>
-
-  <!-- TAB 5: FILE SHARING & REMOTE ACCESS -->
-  <div id="tab-network" class="tab-pane">
-    <div class="card">
-      <div class="card-title"><span>🌍 Remote Access (Opt-In HTTPS Tunnel)</span></div>
-      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">
-        Disabled by default. Start only when you need access outside your local Wi-Fi network; PIN authentication remains enforced.
-      </p>
-      <div id="tunnel-box" style="background:rgba(15,23,42,0.85);padding:12px;border-radius:12px;border:1px solid var(--border);margin-bottom:12px;word-break:break-all;font-size:13px">
-        Status: <b id="tunnel-status">Checking...</b>
-        <div id="tunnel-url-wrap" style="margin-top:6px;display:none">
-          Public URL: <a id="tunnel-link" href="#" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-weight:700"></a>
+            <div class="card">
+              <div class="card-title">
+                <span class="card-title-left">
+                  <svg class="svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"/></svg>
+                  <span>Disk Partitions</span>
+                </span>
+                <button class="btn-sm" onclick="refreshFullStatus(true)">Refresh</button>
+              </div>
+              <div id="disk-list"><div class="subtitle">Scanning storage...</div></div>
+            </div>
+          </div>
         </div>
       </div>
-      <div class="grid-2">
-        <button class="btn-success" onclick="toggleTunnel('start')">🌐 Start Internet Tunnel</button>
-        <button class="btn-danger" onclick="toggleTunnel('stop')">⏹ Stop Tunnel</button>
-      </div>
-    </div>
 
-    <div class="card">
-      <div class="card-title"><span>📤 Upload File to PC (~/Downloads)</span></div>
-      <input type="file" id="file-upload" style="margin-bottom:10px;width:100%;font-size:12px">
-      <button class="btn-primary" style="width:100%" onclick="uploadFile()">⬆️ Upload to PC Now</button>
-    </div>
+      <!-- TAB 2: MEDIA & DISPLAY -->
+      <div id="tab-media" class="tab-pane">
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title"><span>Media Playback</span><span class="badge-pill" id="media-st">Stopped</span></div>
+            <div style="padding:12px;background:var(--card-inner);border-radius:12px;margin-bottom:12px;border:1px solid var(--border)">
+              <div style="font-size:15px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" id="media-title">No media active</div>
+            </div>
+            <div class="grid-3">
+              <button onclick="doMedia('prev')">Prev</button>
+              <button class="btn-primary" onclick="doMedia('play-pause')">Play / Pause</button>
+              <button onclick="doMedia('next')">Next</button>
+            </div>
+          </div>
 
-    <div class="card">
-      <div class="card-title">
-        <span>📥 Download Files from PC (~/Downloads)</span>
-        <button onclick="loadFiles()" style="padding:4px 10px;font-size:11px">🔄 Refresh</button>
-      </div>
-      <div id="file-list">Loading files...</div>
-    </div>
+          <div class="card">
+            <div class="card-title"><span>Audio Volume</span><span id="vol-label" class="num" style="color:var(--accent);font-weight:800">50%</span></div>
+            <input type="range" id="vol-slider" min="0" max="150" value="50" onchange="doMedia('vol_set', this.value)" oninput="previewSlider('vol-label', this.value)">
+            <div class="grid-3">
+              <button onclick="doMedia('vol_down')">-5%</button>
+              <button onclick="doMedia('mute')">Mute Toggle</button>
+              <button onclick="doMedia('vol_up')">+5%</button>
+            </div>
+          </div>
+        </div>
 
-    <div class="card">
-      <div class="card-title">
-        <span>Feedback, Suggestions &amp; Bug Reports</span>
-        <span class="badge-pill">brypra4@gmail.com</span>
-      </div>
-      <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
-        Send suggestions, feature ideas, or bug reports directly to the maintainer inbox.
-      </div>
-      <div style="display:flex;flex-direction:column;gap:8px">
-        <select id="fb-category">
-          <option value="suggestion">Suggestion / Feature Idea</option>
-          <option value="bug">Bug Report</option>
-          <option value="other">Other Question / Feedback</option>
-        </select>
-        <input type="text" id="fb-subject" maxlength="120" placeholder="Short summary / subject">
-        <input type="email" id="fb-reply" maxlength="120" placeholder="Your email (optional, for reply)">
-        <textarea id="fb-message" rows="4" maxlength="4000" placeholder="Describe your suggestion, issue, or steps to reproduce..."></textarea>
-        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer">
-          <input type="checkbox" id="fb-sysinfo" checked style="width:auto">
-          <span>Attach host OS / init / compositor info (no IPs or tokens)</span>
-        </label>
-        <button class="btn-primary" onclick="submitFeedback()" id="fb-submit-btn">Send Feedback</button>
-      </div>
-      <div id="fb-status" style="font-size:12px;margin-top:10px;color:var(--muted)"></div>
-      <div id="fb-fallbacks" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div>
-    </div>
-  </div>
-
-  <!-- TAB 5: SYSTEM LOGS -->
-  <div id="tab-logs" class="tab-pane">
-    <div class="card">
-      <div class="card-title">
-        <span>System Logs &amp; Audit Events</span>
-        <div style="display:flex;gap:6px;align-items:center">
-          <span class="badge-pill" id="logs-init-badge">init: --</span>
-          <button onclick="loadLogs()" style="padding:4px 10px;font-size:11px">Refresh</button>
+        <div class="card">
+          <div class="card-title"><span>Screen Brightness</span><span id="bright-label" class="num" style="color:var(--accent);font-weight:800">50%</span></div>
+          <input type="range" id="bright-slider" min="5" max="100" value="50" onchange="doMedia('bright_set', this.value)" oninput="previewSlider('bright-label', this.value)">
+          <div class="grid-2">
+            <button onclick="doMedia('bright_down')">Dim (-10%)</button>
+            <button onclick="doMedia('bright_up')">Brighten (+10%)</button>
+          </div>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
-        <select id="log-source" onchange="loadLogs()">
-          <option value="all">All Sources</option>
-          <option value="mobile-rc">Mobile-RC Audit</option>
-          <option value="journal">systemd journal</option>
-          <option value="openrc">OpenRC rc.log</option>
-          <option value="syslog">Syslog / messages</option>
-          <option value="dmesg">Kernel dmesg</option>
-        </select>
-        <select id="log-level" onchange="loadLogs()">
-          <option value="all">All Severities</option>
-          <option value="err">Errors Only</option>
-          <option value="warn">Warnings &amp; Errors</option>
-        </select>
+
+      <!-- TAB 3: BOOT, OS & POWER -->
+      <div id="tab-boot" class="tab-pane">
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title">
+              <span>Installed Operating Systems</span>
+              <div style="display:flex;gap:6px">
+                <button class="btn-sm" onclick="loadDistros(false, true)">Refresh</button>
+                <button class="btn-sm" id="btn-deep-scan" onclick="loadDistros(true, true)" style="border-color:rgba(56,189,248,0.45)">Deep Probe</button>
+              </div>
+            </div>
+            <div class="subtitle" id="distro-host-summary" style="margin-bottom:10px">Inspecting host OS environment...</div>
+            <div id="distro-list" style="display:flex;flex-direction:column;gap:6px">Loading OS inventory...</div>
+          </div>
+
+          <div>
+            <div class="card">
+              <div class="card-title"><span>UEFI Boot Switcher (Next Boot)</span></div>
+              <div style="display:flex;flex-direction:column;gap:8px" id="boot-list">
+                <div class="subtitle">Loading UEFI firmware entries...</div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-title"><span>Power &amp; Session Controls</span></div>
+              <div class="grid-2">
+                <button onclick="doPower('lock')">Lock Screen</button>
+                <button onclick="doPower('suspend')">Sleep / Suspend</button>
+                <button class="btn-primary" onclick="confirmBoot('reboot', 'Reboot Host System')">Reboot PC</button>
+                <button class="btn-danger" onclick="confirmBoot('poweroff', 'Power Off Host System')">Shutdown PC</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
-      <div style="display:flex;gap:8px;margin-bottom:10px">
-        <input type="text" id="log-query" placeholder="Filter log message..." onkeydown="if(event.key==='Enter')loadLogs()">
-        <button onclick="loadLogs()">Filter</button>
+
+      <!-- TAB 4: REMOTE CONTROL & SHELL -->
+      <div id="tab-remote" class="tab-pane">
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title"><span>Remote Touchpad &amp; Keys</span><span class="badge-pill" id="tp-status">Ready</span></div>
+            <div id="touchpad-surface" class="touchpad-box">
+              <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 3l14 9-6.5 1.5L10 20 5 3z"/></svg>
+              <span>Drag to move cursor | Tap to left-click</span>
+            </div>
+            <div class="grid-3" style="margin-bottom:8px">
+              <button class="btn-sm" onclick="sendRemoteClick('left')">Left Click</button>
+              <button class="btn-sm" onclick="sendRemoteClick('middle')">Middle</button>
+              <button class="btn-sm" onclick="sendRemoteClick('right')">Right Click</button>
+            </div>
+            <div class="grid-2" style="margin-bottom:8px">
+              <button class="btn-sm" onclick="sendRemoteScroll(-3)">Scroll Up</button>
+              <button class="btn-sm" onclick="sendRemoteScroll(3)">Scroll Down</button>
+            </div>
+            <div class="grid-4">
+              <button class="btn-sm" onclick="sendRemoteKey('Escape')">Esc</button>
+              <button class="btn-sm" onclick="sendRemoteKey('Up')">Up</button>
+              <button class="btn-sm" onclick="sendRemoteKey('BackSpace')">Back</button>
+              <button class="btn-sm" onclick="sendRemoteKey('Return')">Enter</button>
+              <button class="btn-sm" onclick="sendRemoteKey('Left')">Left</button>
+              <button class="btn-sm" onclick="sendRemoteKey('Down')">Down</button>
+              <button class="btn-sm" onclick="sendRemoteKey('Right')">Right</button>
+              <button class="btn-sm" onclick="sendRemoteKey('space')">Space</button>
+            </div>
+          </div>
+
+          <div>
+            <div class="card">
+              <div class="card-title"><span>Clipboard, Notification &amp; URL</span></div>
+              <input type="text" id="msg-input" placeholder="Message, text snippet, or https:// URL..." style="margin-bottom:9px">
+              <div class="grid-3">
+                <button class="btn-primary" onclick="sendInput('notify')">Notify</button>
+                <button onclick="sendInput('clipboard')">Copy to PC</button>
+                <button onclick="sendInput('open_url')">Open URL</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-title"><span>Quick Application Launcher</span></div>
+              <div class="grid-2">
+                <button onclick="doAction('launch', 'terminal')">Open Terminal</button>
+                <button onclick="doAction('launch', 'youtube')">Open YouTube</button>
+                <button onclick="doAction('launch', 'files')">File Manager</button>
+                <button onclick="doAction('launch', 'btop')">System Monitor</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span>Quick Web Terminal</span></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <input type="text" id="cmd-input" style="flex:1;min-width:190px" placeholder="Command (e.g. df -h, uname -a, ip addr)..." onkeydown="handleCmdKey(event)">
+            <button class="btn-primary" onclick="runTerminal('shell')">Run Silent</button>
+            <button onclick="runTerminal('shell_gui')" style="border-color:rgba(56,189,248,0.45)">Open on Screen</button>
+            <button onclick="runTerminal('shell_type')">Type to Active</button>
+          </div>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer">
+            <input type="checkbox" id="cmd-auto-enter" checked style="width:auto">
+            <span>Auto-Enter when typing into active desktop window</span>
+          </label>
+          <pre class="term" id="term-out">Ready to execute commands or type prompts to host...</pre>
+        </div>
       </div>
-      <div id="logs-list" style="max-height:420px;overflow-y:auto;background:rgba(0,0,0,0.28);border:1px solid var(--border);border-radius:10px">
-        <div style="padding:12px;color:var(--muted);font-size:12px">Open Logs tab or tap Refresh to load host logs...</div>
+
+      <!-- TAB 5: SYSTEM LOGS, PROCESSES & SERVICES -->
+      <div id="tab-logs" class="tab-pane">
+        <div class="card">
+          <div class="card-title">
+            <span>System Logs &amp; Audit Events</span>
+            <div style="display:flex;gap:6px;align-items:center">
+              <span class="badge-pill" id="logs-init-badge">init: --</span>
+              <button class="btn-sm" onclick="loadLogs()">Refresh</button>
+            </div>
+          </div>
+          <div class="grid-2" style="margin-bottom:8px">
+            <select id="log-source" onchange="loadLogs()">
+              <option value="all">All Sources</option>
+              <option value="mobile-rc">Mobile-RC Audit</option>
+            </select>
+            <select id="log-level" onchange="loadLogs()">
+              <option value="all">All Severities</option>
+              <option value="err">Errors Only</option>
+              <option value="warn">Warnings &amp; Errors</option>
+            </select>
+          </div>
+          <div style="display:flex;gap:8px;margin-bottom:10px">
+            <input type="text" id="log-query" placeholder="Filter log message..." onkeydown="handleLogQueryKey(event)">
+            <button onclick="loadLogs()">Filter</button>
+          </div>
+          <div id="logs-list" class="scroll-box" style="padding:0">
+            <div class="subtitle" style="padding:12px">Loading host logs...</div>
+          </div>
+        </div>
+
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title">
+              <span>Top Processes</span>
+              <button class="btn-sm" onclick="loadProcesses()">Refresh</button>
+            </div>
+            <div id="proc-list" class="scroll-box">
+              <div class="subtitle" style="padding:10px">Open tab or click Refresh to inspect processes...</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              <span>Host Services</span>
+              <button class="btn-sm" onclick="loadServices()">Refresh</button>
+            </div>
+            <input type="text" id="svc-filter" placeholder="Search service name..." style="margin-bottom:8px" oninput="filterServices()">
+            <div id="svc-list" class="scroll-box">
+              <div class="subtitle" style="padding:10px">Open tab or click Refresh to inspect services...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 6: NETWORK, DEVICES, FILES & FEEDBACK -->
+      <div id="tab-network" class="tab-pane">
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title">
+              <span>LAN Addresses &amp; Wake-on-LAN MACs</span>
+              <button class="btn-sm" onclick="refreshFullStatus(true)">Refresh</button>
+            </div>
+            <div id="lan-info-box"><div class="subtitle">Loading interface addresses...</div></div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              <span>Paired Mobile Devices</span>
+              <button class="btn-sm" onclick="loadDevices()">Refresh</button>
+            </div>
+            <div id="devices-list"><div class="subtitle">Loading paired devices...</div></div>
+          </div>
+        </div>
+
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title"><span>Remote HTTPS Tunnel (Opt-In)</span></div>
+            <p class="subtitle" style="margin-bottom:10px">Disabled by default. Enable only when connecting outside your LAN; RAC / PIN login remains mandatory.</p>
+            <div id="tunnel-box" style="background:var(--card-inner);padding:11px;border-radius:11px;border:1px solid var(--border);margin-bottom:10px;word-break:break-all;font-size:12px">
+              Status: <b id="tunnel-status">Checking...</b>
+              <div id="tunnel-url-wrap" style="margin-top:6px;display:none">
+                Public URL: <a id="tunnel-link" href="#" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-weight:700"></a>
+              </div>
+            </div>
+            <div class="grid-2">
+              <button class="btn-success" onclick="toggleTunnel('start')">Start Tunnel</button>
+              <button class="btn-danger" onclick="toggleTunnel('stop')">Stop Tunnel</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title"><span>Upload File to Host Downloads</span></div>
+            <input type="file" id="file-upload" style="margin-bottom:10px;font-size:12px">
+            <button class="btn-primary" style="width:100%" onclick="uploadFile()">Upload to PC Now</button>
+          </div>
+        </div>
+
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title">
+              <span>Download Files from Host</span>
+              <button class="btn-sm" onclick="loadFiles()">Refresh</button>
+            </div>
+            <div id="file-list" class="scroll-box" style="max-height:280px"><div class="subtitle" style="padding:10px">Loading files...</div></div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              <span>Feedback &amp; Bug Reports</span>
+              <span class="badge-pill">brypra4@gmail.com</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <select id="fb-category">
+                <option value="suggestion">Suggestion / Feature Idea</option>
+                <option value="bug">Bug Report</option>
+                <option value="other">Other Question / Feedback</option>
+              </select>
+              <input type="text" id="fb-subject" maxlength="120" placeholder="Short summary / subject">
+              <input type="email" id="fb-reply" maxlength="120" placeholder="Your email (optional, for reply)">
+              <textarea id="fb-message" rows="3" maxlength="4000" placeholder="Describe your suggestion, issue, or reproduction steps..."></textarea>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer">
+                <input type="checkbox" id="fb-sysinfo" checked style="width:auto">
+                <span>Attach host OS / init / compositor info (no IPs or tokens)</span>
+              </label>
+              <button class="btn-primary" onclick="submitFeedback()" id="fb-submit-btn">Send Feedback</button>
+            </div>
+            <div id="fb-status" style="font-size:12px;margin-top:8px;color:var(--muted)"></div>
+            <div id="fb-fallbacks" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 </div>
 
-<!-- BOTTOM NAV -->
-<div class="bottom-nav">
-  <button class="nav-item active" onclick="switchTab('monitor', this)"><span>📊</span><span>Monitor</span></button>
-  <button class="nav-item" onclick="switchTab('media', this)"><span>🎵</span><span>Media</span></button>
-  <button class="nav-item" onclick="switchTab('boot', this)"><span>🚀</span><span>Boot/OS</span></button>
-  <button class="nav-item" onclick="switchTab('remote', this)"><span>⌨️</span><span>Remote</span></button>
-  <button class="nav-item" onclick="switchTab('logs', this)"><span>LOG</span><span>Logs</span></button>
-  <button class="nav-item" onclick="switchTab('network', this)"><span>🌍</span><span>Net &amp; Feed</span></button>
-</div>
+<nav class="bottom-nav">
+  <button class="nav-item active" data-tab="monitor" onclick="switchTab('monitor', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 3 5-6"/></svg>
+    <span>Monitor</span>
+  </button>
+  <button class="nav-item" data-tab="media" onclick="switchTab('media', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="5.5" cy="17.5" r="2.5"/><circle cx="17.5" cy="15.5" r="2.5"/><path d="M8 17.5V6l12-2v11.5"/></svg>
+    <span>Media</span>
+  </button>
+  <button class="nav-item" data-tab="boot" onclick="switchTab('boot', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+    <span>Boot</span>
+  </button>
+  <button class="nav-item" data-tab="remote" onclick="switchTab('remote', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M8 14h8"/></svg>
+    <span>Remote</span>
+  </button>
+  <button class="nav-item" data-tab="logs" onclick="switchTab('logs', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="14" x2="13" y2="14"/></svg>
+    <span>System</span>
+  </button>
+  <button class="nav-item" data-tab="network" onclick="switchTab('network', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><line x1="3.6" y1="9" x2="20.4" y2="9"/><line x1="3.6" y1="15" x2="20.4" y2="15"/></svg>
+    <span>Network</span>
+  </button>
+</nav>
 
 <script>
-let _csrfToken = '';
-let _authenticated = false;
-let _pollTimer = null;
-let _liveTimer = null;
-let _liveEnabled = true;
-let _shotInFlight = false;
-let _liveShotUrl = '';
 let _activeTab = 'monitor';
-let _lastWsSig = '';
+let _liveEnabled = true;
+let _liveIntervalMs = 2000;
+let _liveTimer = null;
+let _shotInFlight = false;
+let _liveShotUrl = null;
 let _cachedBootEntries = null;
+let _authenticated = false;
+let _csrfToken = '';
+let _pollTimer = null;
+let _lastWsSig = '';
+let _lastDiskSig = '';
+let _cpuHist = [];
+let _netHist = [];
+let _servicesCache = [];
+let _pendingModal = null;
+let _pinMode = 'on_demand';
+let _loginBusy = false;
+
+function handleEmailKey(e) { if (e && e.key === 'Enter') requestEmailCode(); }
+function handlePinKey(e) { if (e && e.key === 'Enter') submitLogin(); }
+function handleCmdKey(e) { if (e && e.key === 'Enter') runTerminal('shell'); }
+function handleLogQueryKey(e) { if (e && e.key === 'Enter') loadLogs(); }
+function stopModalBubble(e) { if (e) e.stopPropagation(); }
+
+function previewSlider(labelId, val) {
+  const el = document.getElementById(labelId);
+  if (el) el.textContent = String(val) + '%';
+}
 
 function toast(msg) {
   const t = document.getElementById('toast');
+  if (!t) return;
   t.textContent = msg;
-  t.style.display = 'block';
-  clearTimeout(window._toastTimer);
-  window._toastTimer = setTimeout(() => { t.style.display = 'none'; }, 2600);
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2600);
 }
 
 function showLogin(msg = '') {
   _authenticated = false;
-  _csrfToken = '';
-  if (_pollTimer) {
-    clearInterval(_pollTimer);
-    _pollTimer = null;
-  }
-  if (_liveTimer) {
-    clearTimeout(_liveTimer);
-    _liveTimer = null;
-  }
-  _shotInFlight = false;
-  const shotImg = document.getElementById('live-shot');
-  const shotPh = document.getElementById('shot-placeholder');
-  if (shotImg) {
-    shotImg.removeAttribute('src');
-    shotImg.style.display = 'none';
-  }
-  if (shotPh) {
-    shotPh.textContent = 'Loading live desktop screen...';
-    shotPh.style.display = 'block';
-  }
-  if (_liveShotUrl) {
-    URL.revokeObjectURL(_liveShotUrl);
-    _liveShotUrl = '';
-  }
+  if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
   const pinEl = document.getElementById('pin-input');
   if (pinEl) pinEl.value = '';
   const emailSt = document.getElementById('email-otp-status');
@@ -3404,31 +4702,35 @@ function showLogin(msg = '') {
   }
 }
 
+function scheduleTelemetryPoll(delayMs = 3500) {
+  if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+  if (_authenticated && !document.hidden) {
+    _pollTimer = setTimeout(async () => {
+      await refreshTelemetry();
+      scheduleTelemetryPoll(3500);
+    }, delayMs);
+  }
+}
+
 function hideLogin() {
   _authenticated = true;
   _lastWsSig = '';
+  _lastDiskSig = '';
   document.getElementById('login-err').textContent = '';
   document.getElementById('pin-input').value = '';
   document.getElementById('login-overlay').style.display = 'none';
-  if (!_pollTimer) {
-    _pollTimer = setInterval(refreshStatus, 3500);
-  }
   updateLiveButton();
-  refreshStatus();
+  refreshFullStatus(false);
+  scheduleTelemetryPoll(3500);
   refreshScreenshot(true);
 }
-
-let _pinMode = 'on_demand';
-let _loginBusy = false;
 
 function onPinInput(el) {
   if (!el) return;
   if (_pinMode !== 'static') {
     const digits = el.value.replace(/\D+/g, '').slice(0, 6);
     if (el.value !== digits) el.value = digits;
-    if (digits.length === 6 && !_loginBusy) {
-      submitLogin();
-    }
+    if (digits.length === 6 && !_loginBusy) submitLogin();
   }
 }
 
@@ -3437,9 +4739,7 @@ async function initAuth() {
   const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
   const handoff = (urlParams.get('handoff') || hashParams.get('handoff') || '').trim();
   const autoRac = (urlParams.get('rac') || hashParams.get('rac') || '').trim();
-  if (handoff || autoRac) {
-    window.history.replaceState(null, '', window.location.pathname);
-  }
+  if (handoff || autoRac) window.history.replaceState(null, '', window.location.pathname);
   try {
     const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
     const d = await r.json();
@@ -3452,20 +4752,18 @@ async function initAuth() {
       if (badge) badge.textContent = 'Mobile-RC • Online Access';
       if (d.email_otp_enabled) {
         if (emailBox) emailBox.style.display = 'block';
-        if (hint) hint.textContent = 'Different network detected. Enter your registered email to receive a 6-digit RAC (auto-unlocks on 6th digit).';
+        if (hint) hint.textContent = 'External network detected. Request a 6-digit RAC via your registered email (auto-unlocks on 6th digit).';
       } else {
         if (emailBox) emailBox.style.display = 'none';
-        if (hint) hint.textContent = 'Different network detected. Configure Email OTP on PC via: sudo control-access --setup-email';
+        if (hint) hint.textContent = 'External network detected. Configure Email OTP on host via: control-access --setup-email';
       }
     } else {
       if (badge) badge.textContent = 'Mobile-RC • Local LAN';
       if (emailBox) emailBox.style.display = 'none';
       if (hint) {
-        if (d && d.pin_mode === 'static') {
-          hint.textContent = 'Enter the configured PIN stored in /opt/mobile-rc/pin.txt on your PC.';
-        } else {
-          hint.textContent = 'Local network: run sudo control-access on your PC/Laptop and enter the 6-digit RAC below (auto-unlocks on 6th digit).';
-        }
+        hint.textContent = (d && d.pin_mode === 'static')
+          ? 'Enter the static PIN configured in pin.txt on your host.'
+          : 'Local LAN: run control-access on your host and enter the 6-digit RAC below.';
       }
     }
     if (emailStatus) emailStatus.textContent = '';
@@ -3507,17 +4805,11 @@ async function requestEmailCode() {
   const btn = document.getElementById('send-email-btn');
   const email = (emailEl ? emailEl.value : '').trim();
   if (!email || !email.includes('@')) {
-    if (statusEl) {
-      statusEl.style.color = '#fca5a5';
-      statusEl.textContent = 'Please enter a valid email address.';
-    }
+    if (statusEl) { statusEl.style.color = '#fca5a5'; statusEl.textContent = 'Please enter a valid email address.'; }
     return;
   }
   if (btn) btn.disabled = true;
-  if (statusEl) {
-    statusEl.style.color = 'var(--muted)';
-    statusEl.textContent = 'Sending verification code...';
-  }
+  if (statusEl) { statusEl.style.color = 'var(--muted)'; statusEl.textContent = 'Sending verification code...'; }
   try {
     const r = await fetch('/api/pairing/email-code', {
       method: 'POST',
@@ -3527,10 +4819,7 @@ async function requestEmailCode() {
     });
     const d = await r.json();
     if (r.ok && d.ok) {
-      if (statusEl) {
-        statusEl.style.color = 'var(--success)';
-        statusEl.textContent = d.message || 'Check your inbox for the 6-digit code.';
-      }
+      if (statusEl) { statusEl.style.color = 'var(--success)'; statusEl.textContent = d.message || 'Check your inbox for the 6-digit code.'; }
       const pinInp = document.getElementById('pin-input');
       if (pinInp) pinInp.focus();
     } else if (statusEl) {
@@ -3538,10 +4827,7 @@ async function requestEmailCode() {
       statusEl.textContent = d.message || 'Could not send email code.';
     }
   } catch (e) {
-    if (statusEl) {
-      statusEl.style.color = '#fca5a5';
-      statusEl.textContent = 'Connection error while sending email code.';
-    }
+    if (statusEl) { statusEl.style.color = '#fca5a5'; statusEl.textContent = 'Connection error while sending email code.'; }
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -3551,10 +4837,7 @@ async function submitLogin() {
   if (_loginBusy) return;
   const pin = document.getElementById('pin-input').value.trim();
   const errEl = document.getElementById('login-err');
-  if (!pin) {
-    errEl.textContent = 'Please enter your access code.';
-    return;
-  }
+  if (!pin) { errEl.textContent = 'Please enter your access code.'; return; }
   _loginBusy = true;
   errEl.textContent = 'Verifying...';
   try {
@@ -3580,9 +4863,7 @@ async function submitLogin() {
 }
 
 async function doLogout() {
-  try {
-    await api('/api/logout', 'POST', {});
-  } catch (e) {}
+  try { await api('/api/logout', 'POST', {}); } catch (e) {}
   _cachedBootEntries = null;
   showLogin('Locked');
 }
@@ -3590,219 +4871,265 @@ async function doLogout() {
 function switchTab(name, btn) {
   _activeTab = name;
   document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-  document.getElementById('tab-' + name).classList.add('active');
-  btn.classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.tab === name);
+  });
+  const pane = document.getElementById('tab-' + name);
+  if (pane) pane.classList.add('active');
   if (name === 'monitor') {
-    if (_liveEnabled && _authenticated) refreshScreenshot(true);
+    if (_liveEnabled && _liveIntervalMs > 0 && _authenticated) refreshScreenshot(true);
   } else if (_liveTimer) {
     clearTimeout(_liveTimer);
     _liveTimer = null;
   }
   if (name === 'boot') loadDistros(false, false);
-  if (name === 'logs') loadLogs();
-  if (name === 'network') loadFiles();
+  if (name === 'logs') { loadLogs(); loadProcesses(); loadServices(); }
+  if (name === 'network') { loadFiles(); loadDevices(); }
 }
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
-    if (_liveTimer) {
-      clearTimeout(_liveTimer);
-      _liveTimer = null;
-    }
-  } else if (_authenticated && _activeTab === 'monitor' && _liveEnabled) {
-    refreshScreenshot(true);
+    if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+    if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
+  } else if (_authenticated) {
+    refreshTelemetry();
+    scheduleTelemetryPoll(3500);
+    if (_activeTab === 'monitor' && _liveEnabled && _liveIntervalMs > 0) refreshScreenshot(true);
   }
 });
 
 async function api(path, method = 'GET', body = null) {
   const opts = { method, credentials: 'same-origin', headers: {} };
-  if (method !== 'GET' && _csrfToken) {
-    opts.headers['X-CSRF-Token'] = _csrfToken;
-  }
+  if (method !== 'GET' && _csrfToken) opts.headers['X-CSRF-Token'] = _csrfToken;
   if (body !== null) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
   const r = await fetch(path, opts);
   if (r.status === 401) {
-    showLogin('Session expired. Enter PIN again.');
+    showLogin('Session expired. Enter access code again.');
     throw new Error('Unauthorized');
   }
   return await r.json();
 }
 
-async function refreshStatus() {
-  if (!_authenticated) return;
-  try {
-    const d = await api('/api/status');
-    document.getElementById('os-name').textContent = d.os.name;
-    document.getElementById('hostname').textContent = d.os.hostname;
-    document.getElementById('kernel-uptime').textContent = `${d.os.kernel} • Up ${d.os.uptime}`;
+function renderSparkline(containerId, values, maxFloor, colorHex) {
+  const wrap = document.getElementById(containerId);
+  if (!wrap || !values.length) return;
+  const maxVal = Math.max(maxFloor, ...values);
+  const w = 120;
+  const h = 28;
+  const n = values.length;
+  const pts = values.map((v, idx) => {
+    const x = n === 1 ? w : Math.round((idx / (n - 1)) * w * 10) / 10;
+    const y = Math.round((h - 2 - (Math.max(0, v) / maxVal) * (h - 5)) * 10) / 10;
+    return x + ',' + y;
+  });
+  wrap.textContent = '';
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 120 28');
+  svg.setAttribute('preserveAspectRatio', 'none');
+  const polyArea = document.createElementNS(ns, 'polygon');
+  polyArea.setAttribute('fill', colorHex);
+  polyArea.setAttribute('fill-opacity', '0.16');
+  polyArea.setAttribute('points', '0,28 ' + pts.join(' ') + ' ' + w + ',28');
+  const polyLine = document.createElementNS(ns, 'polyline');
+  polyLine.setAttribute('fill', 'none');
+  polyLine.setAttribute('stroke', colorHex);
+  polyLine.setAttribute('stroke-width', '1.8');
+  polyLine.setAttribute('stroke-linejoin', 'round');
+  polyLine.setAttribute('points', pts.join(' '));
+  svg.appendChild(polyArea);
+  svg.appendChild(polyLine);
+  wrap.appendChild(svg);
+}
 
-    document.getElementById('cpu-val').textContent = d.cpu_pct + '%';
-    document.getElementById('cpu-bar').style.width = Math.min(100, d.cpu_pct) + '%';
+function applyTelemetryData(d) {
+  if (!d || !d.os) return;
+  document.getElementById('os-name').textContent = d.os.name;
+  document.getElementById('side-os-badge').textContent = d.os.name + ' (' + (d.init_system || 'host') + ')';
+  document.getElementById('hostname').textContent = d.os.hostname;
+  document.getElementById('kernel-uptime').textContent = d.os.kernel + ' | Up ' + d.os.uptime;
 
-    document.getElementById('temp-val').textContent = d.cpu_temp + '°C';
-    document.getElementById('temp-bar').style.width = Math.min(100, d.cpu_temp) + '%';
+  const cpuPct = Number(d.cpu_pct || 0);
+  _cpuHist.push(cpuPct);
+  if (_cpuHist.length > 30) _cpuHist.shift();
+  const peakCpu = Math.round(Math.max(..._cpuHist));
+  document.getElementById('cpu-val').textContent = cpuPct + '%';
+  document.getElementById('cpu-peak').textContent = 'Peak ' + peakCpu + '%';
+  document.getElementById('cpu-bar').style.width = Math.min(100, cpuPct) + '%';
+  renderSparkline('cpu-spark', _cpuHist, 100, '#38bdf8');
 
-    document.getElementById('ram-val').textContent = `${d.ram.used_gb}/${d.ram.total_gb} GB`;
-    document.getElementById('ram-bar').style.width = d.ram.percent + '%';
+  document.getElementById('temp-val').textContent = d.cpu_temp + '°C';
+  document.getElementById('temp-bar').style.width = Math.min(100, Number(d.cpu_temp || 0)) + '%';
 
-    const bat = d.battery || {};
-    const gpu = d.gpu || {};
-    const swap = d.swap || {};
-    const net = d.network || {};
-    const batLabelEl = document.getElementById('bat-label');
-    const batSubEl = document.getElementById('bat-sub');
-    const batBarEl = document.getElementById('bat-bar');
-    if (bat.percent !== null && bat.percent !== undefined) {
-      batLabelEl.textContent = bat.has_ups ? 'UPS BACKUP' : 'BATTERY LEVEL';
-      document.getElementById('bat-val').textContent = bat.percent + '%';
-      batBarEl.style.width = bat.percent + '%';
-      document.getElementById('bat-top').textContent = (bat.plugged ? '⚡' : '') + bat.percent + '%';
-      document.getElementById('bat-status').textContent = bat.status || 'Battery';
-    } else {
-      batLabelEl.textContent = gpu.available ? 'DESKTOP / GPU' : 'HOST POWER';
-      let gpuVal = 'AC';
-      let barPct = 100;
-      if (gpu.busy_pct !== null && gpu.busy_pct !== undefined) {
-        gpuVal = gpu.busy_pct + '%';
-        barPct = Math.max(0, Math.min(100, gpu.busy_pct));
-      } else if (gpu.temp_c !== null && gpu.temp_c !== undefined) {
-        gpuVal = gpu.temp_c + ' C';
-        barPct = Math.min(100, Math.round(gpu.temp_c));
-      }
-      document.getElementById('bat-val').textContent = gpuVal;
-      batBarEl.style.width = barPct + '%';
-      document.getElementById('bat-top').textContent = 'AC';
-      document.getElementById('bat-status').textContent = (gpu.temp_c !== null && gpu.temp_c !== undefined) ? (gpu.temp_c + ' C GPU') : (bat.status || 'AC Desktop');
+  document.getElementById('ram-val').textContent = d.ram.used_gb + '/' + d.ram.total_gb + ' GB';
+  document.getElementById('ram-pct').textContent = d.ram.percent + '%';
+  document.getElementById('ram-bar').style.width = d.ram.percent + '%';
+
+  const bat = d.battery || {};
+  const gpu = d.gpu || {};
+  const swap = d.swap || {};
+  const net = d.network || {};
+  const batLabelEl = document.getElementById('bat-label');
+  const batSubEl = document.getElementById('bat-sub');
+  const batBarEl = document.getElementById('bat-bar');
+  if (bat.percent !== null && bat.percent !== undefined) {
+    batLabelEl.textContent = bat.has_ups ? 'UPS BACKUP' : 'BATTERY LEVEL';
+    document.getElementById('bat-val').textContent = bat.percent + '%';
+    batBarEl.style.width = bat.percent + '%';
+    document.getElementById('bat-top').textContent = (bat.plugged ? 'AC ' : '') + bat.percent + '%';
+    document.getElementById('bat-status').textContent = bat.status || 'Battery';
+  } else {
+    batLabelEl.textContent = gpu.available ? 'DESKTOP / GPU' : 'HOST POWER';
+    let gpuVal = 'AC';
+    let barPct = 100;
+    if (gpu.busy_pct !== null && gpu.busy_pct !== undefined) {
+      gpuVal = gpu.busy_pct + '%';
+      barPct = Math.max(0, Math.min(100, gpu.busy_pct));
+    } else if (gpu.temp_c !== null && gpu.temp_c !== undefined) {
+      gpuVal = gpu.temp_c + '°C';
+      barPct = Math.min(100, Math.round(gpu.temp_c));
     }
-    const swapTxt = (swap.total_gb > 0) ? ('Swap ' + swap.used_gb + '/' + swap.total_gb + 'GB') : 'Swap off';
-    const netTxt = 'Net RX ' + (net.rx_kbps ?? 0) + ' / TX ' + (net.tx_kbps ?? 0) + ' KiB/s';
-    if (batSubEl) batSubEl.textContent = swapTxt + ' | ' + netTxt;
+    document.getElementById('bat-val').textContent = gpuVal;
+    batBarEl.style.width = barPct + '%';
+    document.getElementById('bat-top').textContent = 'AC';
+    document.getElementById('bat-status').textContent = (gpu.temp_c !== null && gpu.temp_c !== undefined) ? (gpu.temp_c + '°C GPU') : (bat.status || 'AC Host');
+  }
+  const rx = Number(net.rx_kbps || 0);
+  const tx = Number(net.tx_kbps || 0);
+  _netHist.push(Math.round((rx + tx) * 10) / 10);
+  if (_netHist.length > 30) _netHist.shift();
+  const swapTxt = (swap.total_gb > 0) ? ('Swap ' + swap.used_gb + '/' + swap.total_gb + 'GB') : 'Swap off';
+  if (batSubEl) batSubEl.textContent = swapTxt + ' | RX ' + rx + ' / TX ' + tx + ' KiB/s';
+  renderSparkline('net-spark', _netHist, 64, '#10b981');
 
-    document.getElementById('vol-label').textContent = (d.media.muted ? '🔇 ' : '') + d.media.volume + '%';
+  if (d.media) {
+    document.getElementById('vol-label').textContent = (d.media.muted ? 'MUTED ' : '') + d.media.volume + '%';
     document.getElementById('vol-slider').value = d.media.volume;
     document.getElementById('bright-label').textContent = d.media.brightness + '%';
     document.getElementById('bright-slider').value = d.media.brightness;
     document.getElementById('media-st').textContent = d.media.media_status;
     document.getElementById('media-title').textContent = d.media.media_title;
+  }
 
-    // Render Workspaces dynamically matching laptop workspaces (wraps to new rows after 4)
-    const wsEl = document.getElementById('ws-list');
-    if (wsEl) {
-      const wsList = Array.isArray(d.workspaces) && d.workspaces.length
-        ? d.workspaces
-        : [
-            { id: 1, name: '1', active: true },
-            { id: 2, name: '2', active: false },
-            { id: 3, name: '3', active: false },
-            { id: 4, name: '4', active: false },
-          ];
-      const wsSig = wsList.map(w => `${w.id}:${w.name || w.id}:${w.active ? 1 : 0}`).join('|');
-      if (wsSig !== _lastWsSig) {
-        _lastWsSig = wsSig;
-        const cols = wsList.length <= 4 ? wsList.length : 4;
-        wsEl.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-        wsEl.textContent = '';
-        for (const w of wsList) {
-          const b = document.createElement('button');
-          if (w.active) b.className = 'btn-primary';
-          const label = w.name && String(w.name) !== String(w.id) ? `WS ${w.id} (${w.name})` : `WS ${w.id}`;
-          b.textContent = label;
-          b.addEventListener('click', () => doAction('ws', String(w.id)));
-          wsEl.appendChild(b);
+  const wsEl = document.getElementById('ws-list');
+  if (wsEl) {
+    const wsList = Array.isArray(d.workspaces) && d.workspaces.length
+      ? d.workspaces
+      : [{ id: 1, name: '1', active: true }, { id: 2, name: '2', active: false }, { id: 3, name: '3', active: false }, { id: 4, name: '4', active: false }];
+    const wsSig = wsList.map(w => w.id + ':' + (w.name || w.id) + ':' + (w.active ? 1 : 0)).join('|');
+    if (wsSig !== _lastWsSig) {
+      _lastWsSig = wsSig;
+      wsEl.style.gridTemplateColumns = 'repeat(' + (wsList.length <= 4 ? wsList.length : 4) + ', 1fr)';
+      wsEl.textContent = '';
+      for (const w of wsList) {
+        const b = document.createElement('button');
+        b.className = w.active ? 'btn-sm btn-primary' : 'btn-sm';
+        b.textContent = (w.name && String(w.name) !== String(w.id)) ? ('WS ' + w.id + ' (' + w.name + ')') : ('WS ' + w.id);
+        b.addEventListener('click', () => doAction('ws', String(w.id)));
+        wsEl.appendChild(b);
+      }
+    }
+  }
+
+  const dl = document.getElementById('disk-list');
+  if (dl && Array.isArray(d.disks)) {
+    const diskSig = d.disks.map(x => x.part + ':' + x.use_pct + ':' + x.size + ':' + (x.mounted ? 1 : 0)).join('|');
+    if (diskSig !== _lastDiskSig) {
+      _lastDiskSig = diskSig;
+      dl.textContent = '';
+      if (d.disks.length) {
+        for (const x of d.disks) {
+          const row = document.createElement('div');
+          row.className = 'row-item';
+          const col = document.createElement('div');
+          col.className = 'row-item-col';
+          const title = document.createElement('div');
+          title.className = 'row-title';
+          title.textContent = x.label + ' (' + x.part + ')';
+          const sub = document.createElement('div');
+          sub.className = 'row-sub';
+          sub.textContent = (x.fstype || 'disk') + ' | ' + x.size + (x.mountpoint ? (' | ' + x.mountpoint) : '');
+          col.appendChild(title);
+          col.appendChild(sub);
+          const pill = document.createElement('span');
+          pill.className = 'badge-pill num ' + (x.mounted ? 'pill-ok' : '');
+          pill.textContent = x.use_pct || '--';
+          row.appendChild(col);
+          row.appendChild(pill);
+          dl.appendChild(row);
         }
+      } else {
+        const empty = document.createElement('div');
+        empty.className = 'subtitle';
+        empty.textContent = 'No storage partitions detected.';
+        dl.appendChild(empty);
       }
     }
+  }
 
-    // Render Disks safely via DOM nodes
-    const dl = document.getElementById('disk-list');
-    dl.textContent = '';
-    if (d.disks && d.disks.length) {
-      for (const x of d.disks) {
-        const row = document.createElement('div');
-        row.className = 'file-item';
-
-        const left = document.createElement('div');
-        const bLabel = document.createElement('b');
-        bLabel.textContent = x.label;
-        const meta = document.createElement('span');
-        meta.style.cssText = 'color:var(--muted);font-size:11px';
-        meta.textContent = ` (/dev/${x.part} • ${x.fstype})`;
-        left.appendChild(bLabel);
-        left.appendChild(meta);
-
-        const right = document.createElement('div');
-        right.style.cssText = `font-size:12px;color:${x.mounted ? 'var(--success)' : 'var(--muted)'}`;
-        right.appendChild(document.createTextNode(`${x.size} • `));
-        const bUse = document.createElement('b');
-        bUse.textContent = x.use_pct;
-        right.appendChild(bUse);
-
-        row.appendChild(left);
-        row.appendChild(right);
-        dl.appendChild(row);
-      }
-    } else {
-      const empty = document.createElement('div');
-      empty.style.cssText = 'color:var(--muted);font-size:12px';
-      empty.textContent = 'No block storage detected.';
-      dl.appendChild(empty);
-    }
-
-    // Render Multi-Boot entries safely via DOM nodes + addEventListener
-    if (!_cachedBootEntries && d.boot_entries) {
+  if (d.boot_entries && (!_cachedBootEntries || d.boot_entries.length)) {
+    const sameBoot = _cachedBootEntries && JSON.stringify(_cachedBootEntries) === JSON.stringify(d.boot_entries);
+    if (!sameBoot) {
       _cachedBootEntries = d.boot_entries;
       const bl = document.getElementById('boot-list');
       bl.textContent = '';
       for (const e of d.boot_entries) {
         let btnClass = 'btn-os';
-        let icon = '🚀';
         const n = String(e.name || '').toLowerCase();
-        if (n.includes('cachyos') || n.includes('cachy')) { btnClass = 'btn-cachyos'; icon = ''; }
-        else if (n.includes('nixos')) { btnClass = 'btn-nixos'; icon = ''; }
-        else if (n.includes('arch')) { btnClass = 'btn-arch'; icon = '🔵'; }
-        else if (n.includes('garuda')) { btnClass = 'btn-garuda'; icon = '🦅'; }
-        else if (n.includes('gentoo')) { btnClass = 'btn-gentoo'; icon = '🟣'; }
-        else if (n.includes('ubuntu')) { icon = '🟠'; }
-        else if (n.includes('fedora')) { icon = '🔷'; }
-        else if (n.includes('windows')) { icon = '🪟'; }
-
+        if (n.includes('cachyos') || n.includes('cachy')) btnClass += ' btn-cachyos';
+        else if (n.includes('nixos')) btnClass += ' btn-nixos';
+        else if (n.includes('arch')) btnClass += ' btn-arch';
+        else if (n.includes('garuda')) btnClass += ' btn-garuda';
+        else if (n.includes('gentoo')) btnClass += ' btn-gentoo';
         const btn = document.createElement('button');
         btn.className = btnClass;
-        btn.style.cssText = 'justify-content:space-between;padding:16px';
-        const spanLeft = document.createElement('span');
-        if (icon) spanLeft.appendChild(document.createTextNode(`${icon} `));
-        const bold = document.createElement('b');
-        bold.textContent = `Boot into ${e.name}`;
-        spanLeft.appendChild(bold);
-        spanLeft.appendChild(document.createTextNode(` (Boot${e.num})`));
-        const arrow = document.createElement('span');
-        arrow.textContent = '➔';
-        btn.appendChild(spanLeft);
-        btn.appendChild(arrow);
+        const left = document.createElement('span');
+        const b = document.createElement('b');
+        b.textContent = e.name;
+        left.appendChild(b);
+        left.appendChild(document.createTextNode(' (Boot' + e.num + ')'));
+        const badge = document.createElement('span');
+        badge.className = 'badge-pill';
+        badge.textContent = 'Reboot Next';
+        btn.appendChild(left);
+        btn.appendChild(badge);
         btn.addEventListener('click', () => confirmBootNum(e.num, e.name));
         bl.appendChild(btn);
       }
-
       const uefiBtn = document.createElement('button');
-      uefiBtn.style.cssText = 'justify-content:space-between;padding:14px';
-      const uefiLeft = document.createElement('span');
-      uefiLeft.appendChild(document.createTextNode('⚙️ '));
-      const uefiBold = document.createElement('b');
-      uefiBold.textContent = 'Enter BIOS / UEFI Firmware Setup';
-      uefiLeft.appendChild(uefiBold);
-      const uefiArrow = document.createElement('span');
-      uefiArrow.textContent = '➔';
-      uefiBtn.appendChild(uefiLeft);
-      uefiBtn.appendChild(uefiArrow);
+      uefiBtn.className = 'btn-os';
+      const uLeft = document.createElement('b');
+      uLeft.textContent = 'Enter BIOS / UEFI Firmware Setup';
+      const uTag = document.createElement('span');
+      uTag.className = 'badge-pill';
+      uTag.textContent = 'Firmware';
+      uefiBtn.appendChild(uLeft);
+      uefiBtn.appendChild(uTag);
       uefiBtn.addEventListener('click', () => confirmBoot('uefi', 'BIOS / UEFI Firmware Settings'));
       bl.appendChild(uefiBtn);
     }
+  }
 
-    // Tunnel
+  const lanBox = document.getElementById('lan-info-box');
+  if (lanBox) {
+    lanBox.textContent = '';
+    const ips = Array.isArray(d.ips) ? d.ips : [];
+    const macs = Array.isArray(net.macs) ? net.macs : [];
+    if (!ips.length && !macs.length) {
+      const empty = document.createElement('div');
+      empty.className = 'subtitle';
+      empty.textContent = 'No active LAN interfaces reported.';
+      lanBox.appendChild(empty);
+    } else {
+      for (const ip of ips) _appendKvRow(lanBox, 'LAN IPv4', ip);
+      for (const m of macs) _appendKvRow(lanBox, 'WoL (' + (m.iface || 'NIC') + ')', m.mac || '-');
+    }
+  }
+
+  if (d.tunnel) {
     document.getElementById('tunnel-status').textContent = String(d.tunnel.status || 'stopped').toUpperCase();
     const tw = document.getElementById('tunnel-url-wrap');
     if (d.tunnel.url) {
@@ -3813,68 +5140,98 @@ async function refreshStatus() {
     } else {
       tw.style.display = 'none';
     }
+  }
+}
+
+async function refreshTelemetry() {
+  if (!_authenticated || document.hidden) return;
+  try {
+    const d = await api('/api/telemetry');
+    applyTelemetryData(d);
+  } catch (e) {}
+}
+
+async function refreshFullStatus(forceRefresh = false) {
+  if (!_authenticated) return;
+  try {
+    const d = await api('/api/status' + (forceRefresh ? '?refresh=1' : ''));
+    applyTelemetryData(d);
+    if (forceRefresh) toast('Telemetry refreshed');
   } catch (e) {}
 }
 
 function updateLiveButton() {
   const btn = document.getElementById('live-btn');
   if (!btn) return;
-  if (_liveEnabled) {
-    btn.textContent = '● Live ON';
+  if (_liveEnabled && _liveIntervalMs > 0) {
+    btn.textContent = 'Live ON';
     btn.style.borderColor = 'rgba(16,185,129,0.5)';
     btn.style.color = 'var(--success)';
   } else {
-    btn.textContent = '⏸ Live PAUSED';
+    btn.textContent = 'Paused';
     btn.style.borderColor = 'var(--border)';
     btn.style.color = 'var(--muted)';
   }
 }
 
-function toggleLiveMonitor() {
-  _liveEnabled = !_liveEnabled;
+function changeLiveInterval(msVal) {
+  const ms = Number(msVal);
+  _liveIntervalMs = Number.isFinite(ms) ? ms : 2000;
+  _liveEnabled = _liveIntervalMs > 0;
   updateLiveButton();
-  if (_liveTimer) {
-    clearTimeout(_liveTimer);
-    _liveTimer = null;
-  }
-  if (_liveEnabled && _authenticated && _activeTab === 'monitor') {
-    refreshScreenshot(true);
-  }
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
+  if (_liveEnabled && _authenticated && _activeTab === 'monitor') refreshScreenshot(true);
 }
 
-function scheduleLiveShot(delayMs = 1500) {
-  if (_liveTimer) {
-    clearTimeout(_liveTimer);
-    _liveTimer = null;
+function toggleLiveMonitor() {
+  if (_liveIntervalMs === 0) {
+    _liveIntervalMs = 2000;
+    const sel = document.getElementById('live-interval');
+    if (sel) sel.value = '2000';
+    _liveEnabled = true;
+  } else {
+    _liveEnabled = !_liveEnabled;
   }
-  if (_authenticated && _liveEnabled && _activeTab === 'monitor' && !document.hidden) {
-    _liveTimer = setTimeout(() => refreshScreenshot(true), delayMs);
+  updateLiveButton();
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
+  if (_liveEnabled && _authenticated && _activeTab === 'monitor') refreshScreenshot(true);
+}
+
+function openShotModal() {
+  const modal = document.getElementById('shot-modal');
+  const mImg = document.getElementById('shot-modal-img');
+  if (_liveShotUrl && mImg) mImg.src = _liveShotUrl;
+  if (modal) modal.style.display = 'flex';
+  refreshScreenshot(false);
+}
+
+function closeShotModal() {
+  const modal = document.getElementById('shot-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+function scheduleLiveShot() {
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
+  if (_authenticated && _liveEnabled && _liveIntervalMs > 0 && _activeTab === 'monitor' && !document.hidden) {
+    _liveTimer = setTimeout(() => refreshScreenshot(true), _liveIntervalMs);
   }
 }
 
 async function refreshScreenshot(fromAuto = false) {
-  if (!_authenticated) return;
-  if (_shotInFlight) return;
+  if (!_authenticated || _shotInFlight) return;
   _shotInFlight = true;
-  if (_liveTimer) {
-    clearTimeout(_liveTimer);
-    _liveTimer = null;
-  }
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
   const img = document.getElementById('live-shot');
+  const mImg = document.getElementById('shot-modal-img');
   const ph = document.getElementById('shot-placeholder');
   try {
     const r = await fetch('/api/screenshot?t=' + Date.now(), { credentials: 'same-origin' });
-    if (r.status === 401) {
-      showLogin('Session expired. Enter PIN again.');
-      return;
-    }
+    if (r.status === 401) { showLogin('Session expired. Enter access code again.'); return; }
     if (!r.ok) {
-      if (!_liveShotUrl) {
+      if (!_liveShotUrl && ph) {
         img.style.display = 'none';
-        if (ph) {
-          ph.textContent = 'Unable to capture desktop screen';
-          ph.style.display = 'block';
-        }
+        ph.textContent = 'Desktop capture unavailable';
+        ph.style.display = 'block';
       }
       return;
     }
@@ -3884,23 +5241,24 @@ async function refreshScreenshot(fromAuto = false) {
     _liveShotUrl = objUrl;
     img.src = objUrl;
     img.style.display = 'block';
+    if (mImg) mImg.src = objUrl;
     if (ph) ph.style.display = 'none';
-    if (prevUrl) setTimeout(() => URL.revokeObjectURL(prevUrl), 200);
+    if (prevUrl) setTimeout(() => URL.revokeObjectURL(prevUrl), 250);
   } catch (e) {
-    if (!fromAuto && !_liveShotUrl) {
+    if (!fromAuto && !_liveShotUrl && ph) {
       img.style.display = 'none';
-      if (ph) ph.style.display = 'block';
+      ph.style.display = 'block';
     }
   } finally {
     _shotInFlight = false;
-    if (_liveEnabled) scheduleLiveShot(1500);
+    if (_liveEnabled && _liveIntervalMs > 0) scheduleLiveShot();
   }
 }
 
 async function doMedia(action, value = '') {
   const r = await api('/api/media', 'POST', { action, value: String(value) });
   toast(r.message || 'Success');
-  refreshStatus();
+  refreshTelemetry();
 }
 
 async function doPower(target) {
@@ -3908,50 +5266,77 @@ async function doPower(target) {
   toast(r.message || 'Command sent');
 }
 
-async function confirmBoot(target, label) {
-  if (!confirm(`Are you sure you want to execute: ${label}?`)) return;
-  const r = await api('/api/power', 'POST', { target });
-  toast(r.message || 'Command executed!');
+function openConfirmModal(title, msg, payload) {
+  _pendingModal = payload;
+  document.getElementById('power-modal-title').textContent = title;
+  document.getElementById('power-modal-msg').textContent = msg;
+  document.getElementById('power-modal').style.display = 'flex';
 }
 
-async function confirmBootNum(num, name) {
-  if (!confirm(`Reboot PC into ${name} (UEFI Boot${num})?`)) return;
-  const r = await api('/api/power', 'POST', { target: 'bootnum', bootnum: num, name });
-  toast(r.message || ('Rebooting into ' + name + '...'));
+function closePowerModal() {
+  _pendingModal = null;
+  document.getElementById('power-modal').style.display = 'none';
+}
+
+async function execPowerConfirm() {
+  const p = _pendingModal;
+  closePowerModal();
+  if (!p) return;
+  if (p.kind === 'power') {
+    const r = await api('/api/power', 'POST', p.body);
+    toast(r.message || 'Command executed');
+  } else if (p.kind === 'kill') {
+    const r = await api('/api/process/kill', 'POST', { pid: p.pid, signal: 'TERM' });
+    toast(r.message || 'Signal sent');
+    loadProcesses();
+  }
+}
+
+function confirmBoot(target, label) {
+  openConfirmModal('Confirm Power Action', 'Execute: ' + label + '? Active sessions may terminate immediately.', { kind: 'power', body: { target } });
+}
+
+function confirmBootNum(num, name) {
+  openConfirmModal('Switch Boot Target', 'Reboot PC into ' + name + ' (UEFI Boot' + num + ')?', { kind: 'power', body: { target: 'bootnum', bootnum: num, name } });
+}
+
+function confirmKillProc(pid, name) {
+  openConfirmModal('Terminate Process', 'Send SIGTERM / terminate process ' + name + ' (PID ' + pid + ')?', { kind: 'kill', pid, name });
 }
 
 async function doAction(type, value) {
   const r = await api('/api/action', 'POST', { type, value });
   toast(r.message || 'Done');
   if (r.ok !== false && (type === 'ws' || type === 'hypr')) {
-    refreshStatus();
+    refreshTelemetry();
     setTimeout(() => refreshScreenshot(false), 350);
   }
 }
 
 async function sendInput(type) {
   const val = document.getElementById('msg-input').value.trim();
-  if (!val) return toast('Please enter some text first!');
+  if (!val) return toast('Enter a message, snippet, or URL first');
   const r = await api('/api/action', 'POST', { type, value: val });
-  toast(r.message || 'Sent!');
+  toast(r.message || 'Sent');
   document.getElementById('msg-input').value = '';
 }
 
 function _appendSectionHeader(parent, title) {
   const h = document.createElement('div');
-  h.style.cssText = 'font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;margin-top:6px';
+  h.style.cssText = 'font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;margin-top:8px;margin-bottom:2px';
   h.textContent = title;
   parent.appendChild(h);
 }
 
 function _appendKvRow(parent, leftText, rightText) {
   const row = document.createElement('div');
-  row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:8px;padding:7px 9px;background:rgba(0,0,0,0.22);border-radius:8px;font-size:12px';
+  row.className = 'row-item';
   const l = document.createElement('div');
-  l.style.fontWeight = '600';
+  l.className = 'row-title';
   l.textContent = leftText;
   const r = document.createElement('div');
-  r.style.cssText = 'color:var(--muted);font-size:11px;text-align:right';
+  r.className = 'row-sub num';
+  r.style.flexShrink = '0';
   r.textContent = rightText;
   row.appendChild(l);
   row.appendChild(r);
@@ -3963,70 +5348,49 @@ async function loadDistros(deep, refresh) {
   const listEl = document.getElementById('distro-list');
   const btn = document.getElementById('btn-deep-scan');
   if (!sumEl || !listEl) return;
-  if (deep && btn) {
-    btn.disabled = true;
-    btn.textContent = 'Scanning Unmounted...';
-  }
+  if (deep && btn) { btn.disabled = true; btn.textContent = 'Scanning...'; }
   const qs = '?deep=' + (deep ? '1' : '0') + (refresh ? '&refresh=1' : '');
   const d = await api('/api/distros' + qs);
-  if (deep && btn) {
-    btn.disabled = false;
-    btn.textContent = 'Scan Unmounted Partitions';
-  }
-  if (!d || d.ok === false && d.status) {
+  if (deep && btn) { btn.disabled = false; btn.textContent = 'Deep Probe'; }
+  if (!d || (d.ok === false && d.status)) {
     sumEl.textContent = 'Failed to scan host OS inventory.';
     return;
   }
   const h = d.host || {};
-  sumEl.textContent = [h.name || 'Linux', 'Init: ' + (h.init_system || 'unknown'), 'Compositor: ' + (h.compositor || 'unknown'), 'Kernel: ' + (h.kernel || '-'), h.cpu_model || '', h.gpu_name || ''].filter(Boolean).join(' | ');
+  sumEl.textContent = [h.name || 'Host', 'Init: ' + (h.init_system || 'unknown'), 'Comp: ' + (h.compositor || 'unknown'), 'Kernel: ' + (h.kernel || '-'), h.cpu_model || '', h.gpu_name || ''].filter(Boolean).join(' | ');
   listEl.textContent = '';
 
   _appendSectionHeader(listEl, 'Detected Operating Systems (' + (d.detected_distros || []).length + ')');
   (d.detected_distros || []).forEach(item => {
-    _appendKvRow(listEl, item.name || 'Linux', (item.source || '') + (item.detail ? (' - ' + item.detail) : ''));
+    _appendKvRow(listEl, item.name || 'OS', (item.source || '') + (item.detail ? (' - ' + item.detail) : ''));
   });
-
   if (d.unmounted_distros && d.unmounted_distros.length > 0) {
-    _appendSectionHeader(listEl, 'Unmounted Partition Probe Results');
-    d.unmounted_distros.forEach(u => {
-      _appendKvRow(listEl, u.name + ' (' + (u.subvolume || '/') + ')', u.device + ' [' + u.fstype + ']');
-    });
+    _appendSectionHeader(listEl, 'Unmounted Partition Probe');
+    d.unmounted_distros.forEach(u => _appendKvRow(listEl, u.name + ' (' + (u.subvolume || '/') + ')', u.device + ' [' + u.fstype + ']'));
   } else if (d.deep_scan) {
-    _appendKvRow(listEl, 'Unmounted Linux Partitions', 'No additional OS roots found on unmounted partitions');
+    _appendKvRow(listEl, 'Unmounted Partitions', 'No additional OS roots found');
   }
-
   if (d.bootloader_entries && d.bootloader_entries.length > 0) {
-    _appendSectionHeader(listEl, 'Bootloader Config Entries');
-    d.bootloader_entries.slice(0, 12).forEach(b => {
-      _appendKvRow(listEl, b.title || b.file, b.loader + (b.kernel ? (' | ' + b.kernel) : ''));
-    });
+    _appendSectionHeader(listEl, 'Bootloader Entries');
+    d.bootloader_entries.slice(0, 12).forEach(b => _appendKvRow(listEl, b.title || b.file, b.loader + (b.kernel ? (' | ' + b.kernel) : '')));
   }
-
   if (d.filesystems && d.filesystems.length > 0) {
     _appendSectionHeader(listEl, 'Mounted Filesystems');
-    d.filesystems.slice(0, 12).forEach(fs => {
-      _appendKvRow(listEl, fs.target || '/', (fs.fstype || '') + ' (' + (fs.source || '') + ')');
-    });
-  }
-
-  if (d.scan_errors && d.scan_errors.length > 0) {
-    _appendSectionHeader(listEl, 'Scan Notes');
-    d.scan_errors.forEach(err => {
-      _appendKvRow(listEl, 'Warning', String(err));
-    });
+    d.filesystems.slice(0, 10).forEach(fs => _appendKvRow(listEl, fs.target || '/', (fs.fstype || '') + ' (' + (fs.source || '') + ')'));
   }
 }
 
 async function loadLogs() {
   const listEl = document.getElementById('logs-list');
   const badgeEl = document.getElementById('logs-init-badge');
-  if (!listEl) return;
-  const src = document.getElementById('log-source').value;
+  const srcEl = document.getElementById('log-source');
+  if (!listEl || !srcEl) return;
+  const curSrc = srcEl.value || 'all';
   const lvl = document.getElementById('log-level').value;
   const q = document.getElementById('log-query').value.trim();
-  const qs = '?source=' + encodeURIComponent(src) + '&level=' + encodeURIComponent(lvl) + '&q=' + encodeURIComponent(q) + '&lines=120';
+  const qs = '?source=' + encodeURIComponent(curSrc) + '&level=' + encodeURIComponent(lvl) + '&q=' + encodeURIComponent(q) + '&lines=120';
   const d = await api('/api/logs' + qs);
-  if (!d || d.ok === false && d.status) {
+  if (!d || (d.ok === false && d.status)) {
     listEl.textContent = '';
     const errDiv = document.createElement('div');
     errDiv.style.padding = '12px';
@@ -4035,11 +5399,26 @@ async function loadLogs() {
     return;
   }
   if (badgeEl) badgeEl.textContent = 'init: ' + (d.init_system || 'unknown');
+  if (Array.isArray(d.sources)) {
+    const newOpts = ['all', ...d.sources];
+    const existing = Array.from(srcEl.options).map(o => o.value);
+    if (JSON.stringify(existing) !== JSON.stringify(newOpts)) {
+      srcEl.textContent = '';
+      for (const s of newOpts) {
+        const opt = document.createElement('option');
+        opt.value = s;
+        opt.textContent = s === 'all' ? 'All Sources' : s;
+        srcEl.appendChild(opt);
+      }
+      srcEl.value = newOpts.includes(curSrc) ? curSrc : 'all';
+    }
+  }
   listEl.textContent = '';
   const items = d.entries || [];
   if (!items.length) {
     const empty = document.createElement('div');
-    empty.style.cssText = 'padding:12px;color:var(--muted);font-size:12px';
+    empty.className = 'subtitle';
+    empty.style.padding = '12px';
     empty.textContent = 'No log lines matched this filter.';
     listEl.appendChild(empty);
     return;
@@ -4049,11 +5428,212 @@ async function loadLogs() {
     const lvlStr = String(entry.level || 'INFO').toUpperCase();
     const cls = lvlStr.includes('ERR') || lvlStr.includes('CRIT') || lvlStr.includes('FATAL') ? 'log-err' : (lvlStr.includes('WARN') ? 'log-warn' : 'log-info');
     row.className = 'log-line ' + cls;
-    const prefix = [entry.ts, '[' + (entry.source || 'sys') + ']', '[' + lvlStr + ']'].filter(Boolean).join(' ');
-    row.textContent = prefix + ' ' + (entry.message || '');
+    row.textContent = [entry.ts, '[' + (entry.source || 'sys') + ']', '[' + lvlStr + ']'].filter(Boolean).join(' ') + ' ' + (entry.message || '');
     listEl.appendChild(row);
   });
 }
+
+async function loadProcesses() {
+  const el = document.getElementById('proc-list');
+  if (!el) return;
+  const d = await api('/api/processes?limit=25');
+  el.textContent = '';
+  const procs = (d && Array.isArray(d.processes)) ? d.processes : [];
+  if (!procs.length) {
+    const empty = document.createElement('div');
+    empty.className = 'subtitle';
+    empty.style.padding = '10px';
+    empty.textContent = 'No process list returned.';
+    el.appendChild(empty);
+    return;
+  }
+  for (const p of procs) {
+    const row = document.createElement('div');
+    row.className = 'row-item';
+    const col = document.createElement('div');
+    col.className = 'row-item-col';
+    const title = document.createElement('div');
+    title.className = 'row-title';
+    title.textContent = p.name + ' (PID ' + p.pid + ')';
+    const sub = document.createElement('div');
+    sub.className = 'row-sub num';
+    sub.textContent = 'CPU ' + (p.cpu_pct || 0) + '% | RAM ' + (p.rss_mb || 0) + ' MB | ' + (p.cmd || p.name);
+    col.appendChild(title);
+    col.appendChild(sub);
+    const killBtn = document.createElement('button');
+    killBtn.className = 'btn-sm btn-danger';
+    killBtn.textContent = 'Kill';
+    killBtn.addEventListener('click', () => confirmKillProc(p.pid, p.name));
+    row.appendChild(col);
+    row.appendChild(killBtn);
+    el.appendChild(row);
+  }
+}
+
+function renderServicesList() {
+  const el = document.getElementById('svc-list');
+  const q = (document.getElementById('svc-filter')?.value || '').trim().toLowerCase();
+  if (!el) return;
+  el.textContent = '';
+  const filtered = _servicesCache.filter(s => !q || String(s.name || '').toLowerCase().includes(q));
+  if (!filtered.length) {
+    const empty = document.createElement('div');
+    empty.className = 'subtitle';
+    empty.style.padding = '10px';
+    empty.textContent = 'No services matched.';
+    el.appendChild(empty);
+    return;
+  }
+  for (const s of filtered.slice(0, 60)) {
+    const row = document.createElement('div');
+    row.className = 'row-item';
+    const col = document.createElement('div');
+    col.className = 'row-item-col';
+    const title = document.createElement('div');
+    title.className = 'row-title';
+    title.textContent = s.name;
+    const sub = document.createElement('div');
+    sub.className = 'row-sub';
+    const st = String(s.status || 'unknown');
+    const isUp = st.includes('started') || st.includes('active') || st.includes('running') || st === 'ok';
+    sub.textContent = st + (s.runlevel ? (' | ' + s.runlevel) : '');
+    sub.style.color = isUp ? 'var(--success)' : 'var(--muted)';
+    col.appendChild(title);
+    col.appendChild(sub);
+    const acts = document.createElement('div');
+    acts.style.cssText = 'display:flex;gap:4px;flex-shrink:0';
+    for (const actName of (isUp ? ['restart', 'stop'] : ['start'])) {
+      const b = document.createElement('button');
+      b.className = 'btn-sm ' + (actName === 'stop' ? 'btn-danger' : (actName === 'start' ? 'btn-success' : ''));
+      b.textContent = actName[0].toUpperCase() + actName.slice(1);
+      b.addEventListener('click', () => controlSvc(s.name, actName));
+      acts.appendChild(b);
+    }
+    row.appendChild(col);
+    row.appendChild(acts);
+    el.appendChild(row);
+  }
+}
+
+function filterServices() { renderServicesList(); }
+
+async function loadServices() {
+  const d = await api('/api/services');
+  _servicesCache = (d && Array.isArray(d.services)) ? d.services : [];
+  renderServicesList();
+}
+
+async function controlSvc(name, action) {
+  toast(action + ' ' + name + '...');
+  const r = await api('/api/services', 'POST', { name, action });
+  toast(r.message || (r.ok ? 'Done' : 'Failed'));
+  loadServices();
+}
+
+async function loadDevices() {
+  const el = document.getElementById('devices-list');
+  if (!el) return;
+  const d = await api('/api/mobile/devices');
+  el.textContent = '';
+  const devs = (d && Array.isArray(d.devices)) ? d.devices : [];
+  if (!devs.length) {
+    const empty = document.createElement('div');
+    empty.className = 'subtitle';
+    empty.textContent = 'No paired mobile tokens active.';
+    el.appendChild(empty);
+    return;
+  }
+  for (const dev of devs) {
+    const row = document.createElement('div');
+    row.className = 'row-item';
+    const col = document.createElement('div');
+    col.className = 'row-item-col';
+    const title = document.createElement('div');
+    title.className = 'row-title';
+    title.textContent = dev.name || dev.id;
+    const seen = dev.last_seen ? new Date(dev.last_seen * 1000).toLocaleString() : 'Never';
+    const sub = document.createElement('div');
+    sub.className = 'row-sub num';
+    sub.textContent = 'ID: ' + dev.id + ' | Last seen: ' + seen;
+    col.appendChild(title);
+    col.appendChild(sub);
+    const revBtn = document.createElement('button');
+    revBtn.className = 'btn-sm btn-danger';
+    revBtn.textContent = 'Revoke';
+    revBtn.addEventListener('click', () => revokeDevice(dev.id, dev.name));
+    row.appendChild(col);
+    row.appendChild(revBtn);
+    el.appendChild(row);
+  }
+}
+
+async function revokeDevice(id, name) {
+  const r = await api('/api/mobile/revoke', 'POST', { id });
+  toast(r.ok ? ('Revoked ' + (name || id)) : (r.message || 'Revoke failed'));
+  loadDevices();
+}
+
+async function sendRemoteClick(button) {
+  const r = await api('/api/input', 'POST', { kind: 'click', button });
+  const st = document.getElementById('tp-status');
+  if (st) st.textContent = r.ok ? (button + ' click') : (r.message || 'Failed');
+}
+
+async function sendRemoteScroll(dy) {
+  await api('/api/input', 'POST', { kind: 'scroll', dy });
+}
+
+async function sendRemoteKey(key) {
+  const r = await api('/api/input', 'POST', { kind: 'key', key });
+  const st = document.getElementById('tp-status');
+  if (st) st.textContent = r.ok ? ('Key: ' + key) : (r.message || 'Failed');
+}
+
+(function bindTouchpad() {
+  const pad = document.getElementById('touchpad-surface');
+  if (!pad) return;
+  let lastX = null;
+  let lastY = null;
+  let moved = false;
+  let accDx = 0;
+  let accDy = 0;
+  let flushTimer = null;
+
+  const flushMove = () => {
+    flushTimer = null;
+    const dx = Math.round(accDx);
+    const dy = Math.round(accDy);
+    accDx -= dx;
+    accDy -= dy;
+    if (dx !== 0 || dy !== 0) {
+      api('/api/input', 'POST', { kind: 'move', dx, dy }).catch(() => {});
+    }
+  };
+
+  pad.addEventListener('pointerdown', (e) => {
+    pad.setPointerCapture(e.pointerId);
+    lastX = e.clientX;
+    lastY = e.clientY;
+    moved = false;
+  });
+  pad.addEventListener('pointermove', (e) => {
+    if (lastX === null) return;
+    const dx = (e.clientX - lastX) * 1.6;
+    const dy = (e.clientY - lastY) * 1.6;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    if (Math.abs(dx) > 1.5 || Math.abs(dy) > 1.5) moved = true;
+    accDx += dx;
+    accDy += dy;
+    if (!flushTimer) flushTimer = setTimeout(flushMove, 45);
+  });
+  pad.addEventListener('pointerup', () => {
+    if (!moved && lastX !== null) sendRemoteClick('left');
+    lastX = null;
+    lastY = null;
+  });
+  pad.addEventListener('pointercancel', () => { lastX = null; lastY = null; });
+})();
 
 async function submitFeedback() {
   const statusEl = document.getElementById('fb-status');
@@ -4086,7 +5666,7 @@ async function submitFeedback() {
     return;
   }
   statusEl.style.color = '#fde68a';
-  statusEl.textContent = r.message || 'Use an option below to deliver directly to brypra4@gmail.com.';
+  statusEl.textContent = r.message || 'Use an option below to deliver directly.';
   const makeLinkBtn = (label, url, primary) => {
     if (!url || !(url.startsWith('mailto:') || url.startsWith('https://'))) return;
     const a = document.createElement('a');
@@ -4097,8 +5677,8 @@ async function submitFeedback() {
     a.style.cssText = 'display:inline-block;padding:8px 12px;border-radius:10px;text-decoration:none;font-size:12px;font-weight:700;' + (primary ? 'background:var(--accent);color:#0f172a' : 'background:rgba(255,255,255,0.08);color:var(--text);border:1px solid var(--border)');
     fbLinksEl.appendChild(a);
   };
-  makeLinkBtn('Open Email App (brypra4@gmail.com)', r.mailto, true);
-  makeLinkBtn('Open Pre-Filled GitHub Issue', r.github_issue, false);
+  makeLinkBtn('Open Email App', r.mailto, true);
+  makeLinkBtn('Open GitHub Issue', r.github_issue, false);
 }
 
 async function runTerminal(mode) {
@@ -4116,7 +5696,7 @@ async function runTerminal(mode) {
 async function toggleTunnel(act) {
   toast(act === 'start' ? 'Starting public tunnel (~4s)...' : 'Stopping tunnel...');
   const r = await api('/api/tunnel', 'POST', { action: act });
-  refreshStatus();
+  refreshFullStatus(false);
   if (r.url) toast('Public Link Online: ' + r.url);
 }
 
@@ -4127,33 +5707,33 @@ async function loadFiles() {
   fl.textContent = '';
   if (!r.files || !r.files.length) {
     const empty = document.createElement('div');
-    empty.style.cssText = 'color:var(--muted);font-size:12px';
+    empty.className = 'subtitle';
+    empty.style.padding = '10px';
     empty.textContent = 'Downloads folder is empty.';
     fl.appendChild(empty);
     return;
   }
   for (const f of r.files) {
     const item = document.createElement('div');
-    item.className = 'file-item';
-
-    const nameBox = document.createElement('div');
-    nameBox.className = 'file-name';
-    nameBox.title = f.name;
-    nameBox.appendChild(document.createTextNode('📄 ' + f.name + ' '));
-    const szSpan = document.createElement('span');
-    szSpan.style.cssText = 'color:var(--muted);font-size:11px';
-    szSpan.textContent = `(${f.size})`;
-    nameBox.appendChild(szSpan);
-
+    item.className = 'row-item';
+    const col = document.createElement('div');
+    col.className = 'row-item-col';
+    col.title = f.name;
+    const title = document.createElement('div');
+    title.className = 'row-title';
+    title.textContent = f.name;
+    const sub = document.createElement('div');
+    sub.className = 'row-sub num';
+    sub.textContent = f.size;
+    col.appendChild(title);
+    col.appendChild(sub);
     const link = document.createElement('a');
-    link.className = 'btn';
-    link.style.cssText = 'padding:6px 10px;font-size:11px';
     link.href = '/api/download?name=' + encodeURIComponent(f.name);
     link.rel = 'noopener noreferrer';
     link.download = f.name;
-    link.textContent = '⬇️ Download';
-
-    item.appendChild(nameBox);
+    link.textContent = 'Download';
+    link.style.cssText = 'padding:5px 10px;font-size:11px;border-radius:8px;border:1px solid var(--border);color:var(--text);text-decoration:none;font-weight:600;background:rgba(255,255,255,0.06);flex-shrink:0';
+    item.appendChild(col);
     item.appendChild(link);
     fl.appendChild(item);
   }
@@ -4162,7 +5742,7 @@ async function loadFiles() {
 async function uploadFile() {
   if (!_authenticated) return;
   const inp = document.getElementById('file-upload');
-  if (!inp.files.length) return toast('Please select a file first!');
+  if (!inp.files.length) return toast('Select a file first');
   const file = inp.files[0];
   toast('Uploading ' + file.name + '...');
   const r = await fetch('/api/upload?name=' + encodeURIComponent(file.name), {
@@ -4171,12 +5751,9 @@ async function uploadFile() {
     headers: _csrfToken ? { 'X-CSRF-Token': _csrfToken } : {},
     body: file,
   });
-  if (r.status === 401) {
-    showLogin('Session expired. Enter PIN again.');
-    return;
-  }
+  if (r.status === 401) { showLogin('Session expired. Enter access code again.'); return; }
   const res = await r.json();
-  toast(res.message || 'Upload complete!');
+  toast(res.message || 'Upload complete');
   inp.value = '';
   loadFiles();
 }
@@ -4445,6 +6022,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/status":
+            refresh = qs.get("refresh", ["0"])[0].strip().lower() in ("1", "true", "yes")
+            if refresh:
+                _invalidate_cache("local_ips", "gpu_info", "media_display")
             data = {
                 "os": get_os_info(),
                 "init_system": detect_init_system(),
@@ -4457,8 +6037,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 "network": get_network_telemetry(),
                 "media": get_media_and_display(),
                 "workspaces": get_workspaces_info(),
-                "disks": get_disks_info(),
-                "boot_entries": get_boot_entries(),
+                "disks": get_disks_info(refresh=refresh),
+                "boot_entries": get_boot_entries(refresh=refresh),
                 "ips": get_local_ips(),
                 "tunnel": get_tunnel_info(),
             }
@@ -4476,7 +6056,11 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 "gpu": get_gpu_info(),
                 "battery": get_battery_info(),
                 "network": get_network_telemetry(),
+                "media": get_media_and_display(),
+                "workspaces": get_workspaces_info(),
                 "disks": get_disks_info(),
+                "ips": get_local_ips(),
+                "tunnel": get_tunnel_info(),
             })
             return
 
@@ -4508,73 +6092,16 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/screenshot":
-            _, uid, gid, _ = get_target_user_info()
-            with tempfile.TemporaryDirectory(prefix="mrc_shot_") as tmpdir:
-                try:
-                    if os.geteuid() == 0 and uid != 0:
-                        os.chown(tmpdir, uid, gid)
-                    os.chmod(tmpdir, 0o700)
-                except OSError:
-                    pass
-                raw_path = os.path.join(tmpdir, "raw.png")
-                shot_path = os.path.join(tmpdir, "shot.jpg")
-
-                env = get_desktop_env()
-                comp = get_active_compositor(env)
-                capture_cmds = [
-                    ["grim", raw_path],
-                    ["wayshot", "-f", raw_path],
-                    ["spectacle", "-b", "-n", "-o", raw_path],
-                    ["gnome-screenshot", "-f", raw_path],
-                    ["maim", raw_path],
-                    ["scrot", raw_path],
-                    ["import", "-window", "root", raw_path],
-                ]
-                if comp == "kde":
-                    capture_cmds.insert(0, capture_cmds.pop(2))
-                elif comp == "gnome":
-                    capture_cmds.insert(0, capture_cmds.pop(3))
-                for cmd in capture_cmds:
-                    if not find_bin(cmd[0], env["PATH"]):
-                        continue
-                    rc, _, _ = run_as_user(cmd, timeout=8, shell=False)
-                    if rc == 0 and os.path.isfile(raw_path) and os.path.getsize(raw_path) > 1000:
-                        break
-
-                if os.path.isfile(raw_path) and os.path.getsize(raw_path) > 1000:
-                    img = None
-                    ctype = "image/png"
-                    run_first_available([
-                        ["magick", raw_path, "-resize", "1280x800", "-quality", "75", shot_path],
-                        ["convert", raw_path, "-resize", "1280x800", "-quality", "75", shot_path],
-                    ], timeout=8)
-                    if os.path.isfile(shot_path) and os.path.getsize(shot_path) > 1000:
-                        with open(shot_path, "rb") as f:
-                            img = f.read()
-                        ctype = "image/jpeg"
-                    else:
-                        try:
-                            from PIL import Image
-                            with Image.open(raw_path) as im:
-                                rgb_im = im.convert("RGB")
-                                rgb_im.thumbnail((1280, 800))
-                                rgb_im.save(shot_path, "JPEG", quality=75)
-                            with open(shot_path, "rb") as f:
-                                img = f.read()
-                            ctype = "image/jpeg"
-                        except Exception:
-                            with open(raw_path, "rb") as f:
-                                img = f.read()
-                            ctype = "image/png"
-
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", ctype)
-                    self.send_header("Content-Length", str(len(img)))
-                    self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-                    self.send_header("X-Content-Type-Options", "nosniff")
-                    self.end_headers()
-                    self.wfile.write(img)
-                    return
+            img, ctype = capture_desktop_screenshot()
+            if img:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", ctype or "image/jpeg")
+                self.send_header("Content-Length", str(len(img)))
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(img)
+                return
 
             self.send_error(HTTPStatus.NOT_FOUND, "Failed to capture desktop screen")
             return
@@ -5035,7 +6562,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             try:
-                if os.geteuid() == 0 and uid != 0:
+                if not IS_WINDOWS and hasattr(os, "geteuid") and os.geteuid() == 0 and uid != 0:
                     os.chown(dest, uid, gid)
             except OSError:
                 pass
@@ -5055,39 +6582,60 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             act = str(data.get("action", ""))
             val = data.get("value", "")
             if act == "play-pause":
-                run_as_user(["playerctl", "play-pause"])
+                if IS_WINDOWS:
+                    _win_send_vk(0xB3)
+                else:
+                    run_as_user(["playerctl", "play-pause"])
             elif act == "next":
-                run_as_user(["playerctl", "next"])
+                if IS_WINDOWS:
+                    _win_send_vk(0xB0)
+                else:
+                    run_as_user(["playerctl", "next"])
             elif act == "prev":
-                run_as_user(["playerctl", "previous"])
+                if IS_WINDOWS:
+                    _win_send_vk(0xB1)
+                else:
+                    run_as_user(["playerctl", "previous"])
             elif act == "mute":
-                run_first_available([
-                    ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
-                    ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"],
-                    ["amixer", "set", "Master", "toggle"],
-                ])
+                if IS_WINDOWS:
+                    _win_send_vk(0xAD)
+                else:
+                    run_first_available([
+                        ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
+                        ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"],
+                        ["amixer", "set", "Master", "toggle"],
+                    ])
             elif act == "vol_up":
-                run_first_available([
-                    ["wpctl", "set-volume", "-l", "1.5", "@DEFAULT_AUDIO_SINK@", "5%+"],
-                    ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+5%"],
-                    ["amixer", "set", "Master", "5%+"],
-                ])
+                if IS_WINDOWS:
+                    _win_send_vk(0xAF)
+                else:
+                    run_first_available([
+                        ["wpctl", "set-volume", "-l", "1.5", "@DEFAULT_AUDIO_SINK@", "5%+"],
+                        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+5%"],
+                        ["amixer", "set", "Master", "5%+"],
+                    ])
             elif act == "vol_down":
-                run_first_available([
-                    ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"],
-                    ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-5%"],
-                    ["amixer", "set", "Master", "5%-"],
-                ])
+                if IS_WINDOWS:
+                    _win_send_vk(0xAE)
+                else:
+                    run_first_available([
+                        ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"],
+                        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-5%"],
+                        ["amixer", "set", "Master", "5%-"],
+                    ])
             elif act == "vol_set":
                 try:
                     pct = max(0, min(150, int(float(val))))
                 except (TypeError, ValueError):
                     self._send_json({"ok": False, "message": "Invalid volume value"}, HTTPStatus.BAD_REQUEST)
                     return
-                run_first_available([
-                    ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{pct}%"],
-                    ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"],
-                ])
+                if IS_WINDOWS:
+                    _win_coreaudio_set(min(100, pct))
+                else:
+                    run_first_available([
+                        ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{pct}%"],
+                        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"],
+                    ])
             elif act == "bright_up":
                 if not _adjust_brightness("up"):
                     self._send_json({"ok": False, "message": "Brightness control unavailable (internal backlight or ddcutil required)"}, HTTPStatus.NOT_IMPLEMENTED)
@@ -5108,6 +6656,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send_json({"ok": False, "message": "Unsupported media action"}, HTTPStatus.BAD_REQUEST)
                 return
+            _invalidate_cache("media_display")
             self._send_json({"ok": True, "message": f"Action {act} executed"})
             return
 
@@ -5116,6 +6665,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             bootnum = str(data.get("bootnum", "")).strip()
 
             if target == "bootnum":
+                if IS_WINDOWS:
+                    self._send_json({"ok": False, "message": "Per-entry efibootmgr switching is Linux-only; use UEFI Firmware Reboot instead"}, HTTPStatus.NOT_IMPLEMENTED)
+                    return
                 if not re.fullmatch(r"[0-9a-fA-F]{4}", bootnum):
                     self._send_json({"ok": False, "message": "Invalid UEFI boot number"}, HTTPStatus.BAD_REQUEST)
                     return
@@ -5124,6 +6676,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 if rc != 0:
                     self._send_json({"ok": False, "message": f"efibootmgr failed: {err}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
+                _invalidate_cache("boot_entries")
                 name = str(data.get("name", f"Boot{norm_num}"))[:64]
                 threading.Thread(
                     target=_delayed_power,
@@ -5134,6 +6687,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if target in ("arch", "cachyos", "garuda", "gentoo", "nixos", "ubuntu", "fedora", "debian", "windows"):
+                if IS_WINDOWS:
+                    self._send_json({"ok": False, "message": "OS BootNext switching via efibootmgr is Linux-only"}, HTTPStatus.NOT_IMPLEMENTED)
+                    return
                 _, out, _ = run_cmd(["efibootmgr"])
                 found_num = None
                 for line in out.splitlines():
@@ -5151,6 +6707,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 if rc != 0:
                     self._send_json({"ok": False, "message": f"efibootmgr failed: {err}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
+                _invalidate_cache("boot_entries")
                 threading.Thread(
                     target=_delayed_power,
                     args=([["systemctl", "reboot"], ["loginctl", "reboot"], ["reboot"]],),
@@ -5160,33 +6717,46 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if target == "uefi":
-                threading.Thread(
-                    target=_delayed_power,
-                    args=([["systemctl", "reboot", "--firmware-setup"], ["loginctl", "reboot", "--firmware-setup"]],),
-                    daemon=True,
-                ).start()
+                cmds = (
+                    [["shutdown", "/r", "/fw", "/t", "1"]]
+                    if IS_WINDOWS
+                    else [["systemctl", "reboot", "--firmware-setup"], ["loginctl", "reboot", "--firmware-setup"]]
+                )
+                threading.Thread(target=_delayed_power, args=(cmds,), daemon=True).start()
                 self._send_json({"ok": True, "message": "Rebooting into BIOS / UEFI setup..."})
                 return
 
             if target == "reboot":
-                threading.Thread(
-                    target=_delayed_power,
-                    args=([["systemctl", "reboot"], ["loginctl", "reboot"], ["reboot"]],),
-                    daemon=True,
-                ).start()
+                cmds = (
+                    [["shutdown", "/r", "/t", "1", "/c", "Mobile-RC reboot"]]
+                    if IS_WINDOWS
+                    else [["systemctl", "reboot"], ["loginctl", "reboot"], ["reboot"]]
+                )
+                threading.Thread(target=_delayed_power, args=(cmds,), daemon=True).start()
                 self._send_json({"ok": True, "message": "Rebooting system..."})
                 return
 
             if target == "poweroff":
-                threading.Thread(
-                    target=_delayed_power,
-                    args=([["systemctl", "poweroff"], ["loginctl", "poweroff"], ["poweroff"]],),
-                    daemon=True,
-                ).start()
+                cmds = (
+                    [["shutdown", "/s", "/t", "1", "/c", "Mobile-RC shutdown"]]
+                    if IS_WINDOWS
+                    else [["systemctl", "poweroff"], ["loginctl", "poweroff"], ["poweroff"]]
+                )
+                threading.Thread(target=_delayed_power, args=(cmds,), daemon=True).start()
                 self._send_json({"ok": True, "message": "Shutting down system..."})
                 return
 
             if target == "lock":
+                if IS_WINDOWS:
+                    locked = False
+                    try:
+                        locked = bool(ctypes.windll.user32.LockWorkStation())
+                    except Exception:
+                        locked = False
+                    if not locked:
+                        run_cmd(["rundll32.exe", "user32.dll,LockWorkStation"])
+                    self._send_json({"ok": True, "message": "Screen locked!"})
+                    return
                 env = get_desktop_env()
                 comp = get_active_compositor(env)
                 lock_cmds = [
@@ -5212,11 +6782,12 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if target == "suspend":
-                threading.Thread(
-                    target=_delayed_power,
-                    args=([["systemctl", "suspend"], ["loginctl", "suspend"], ["zzz"]],),
-                    daemon=True,
-                ).start()
+                cmds = (
+                    [["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]]
+                    if IS_WINDOWS
+                    else [["systemctl", "suspend"], ["loginctl", "suspend"], ["zzz"]]
+                )
+                threading.Thread(target=_delayed_power, args=(cmds,), daemon=True).start()
                 self._send_json({"ok": True, "message": "Suspending system..."})
                 return
 
@@ -5232,10 +6803,26 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 if not msg or len(msg) > 500:
                     self._send_json({"ok": False, "message": "Notification must be 1-500 characters"}, HTTPStatus.BAD_REQUEST)
                     return
-                run_first_available([
-                    ["notify-send", "-u", "critical", "Mobile-RC Message", msg],
-                    ["hyprctl", "notify", "1", "3000", "rgb(38bdf8)", msg],
-                ])
+                if IS_WINDOWS:
+                    ps_notify = (
+                        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
+                        "$n = New-Object System.Windows.Forms.NotifyIcon; "
+                        "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+                        "$n.Visible = $true; "
+                        "$n.ShowBalloonTip(5000, 'Mobile-RC Message', $env:MRC_NOTIFY_MSG, [System.Windows.Forms.ToolTipIcon]::Info); "
+                        "Start-Sleep -Milliseconds 600; $n.Dispose()"
+                    )
+                    threading.Thread(
+                        target=_win_run_ps,
+                        args=(ps_notify,),
+                        kwargs={"timeout": 8, "extra_env": {"MRC_NOTIFY_MSG": msg}},
+                        daemon=True,
+                    ).start()
+                else:
+                    run_first_available([
+                        ["notify-send", "-u", "critical", "Mobile-RC Message", msg],
+                        ["hyprctl", "notify", "1", "3000", "rgb(38bdf8)", msg],
+                    ])
                 self._send_json({"ok": True, "message": "Notification sent to PC screen!"})
                 return
 
@@ -5244,16 +6831,23 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 if not text or len(text) > 20000:
                     self._send_json({"ok": False, "message": "Clipboard text must be 1-20000 characters"}, HTTPStatus.BAD_REQUEST)
                     return
-                rc, _, err = run_first_available(
-                    [
-                        ["wl-copy"],
-                        ["xclip", "-selection", "clipboard"],
-                        ["xsel", "--clipboard", "--input"],
-                    ],
-                    timeout=4,
-                    input_text=text,
-                    discard_output=True,
-                )
+                if IS_WINDOWS:
+                    rc, _, err = _win_run_ps(
+                        "Set-Clipboard -Value $env:MRC_CLIP_TEXT",
+                        timeout=6,
+                        extra_env={"MRC_CLIP_TEXT": text},
+                    )
+                else:
+                    rc, _, err = run_first_available(
+                        [
+                            ["wl-copy"],
+                            ["xclip", "-selection", "clipboard"],
+                            ["xsel", "--clipboard", "--input"],
+                        ],
+                        timeout=4,
+                        input_text=text,
+                        discard_output=True,
+                    )
                 if rc != 0:
                     self._send_json({"ok": False, "message": f"Clipboard error: {err}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
@@ -5283,7 +6877,14 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 ):
                     self._send_json({"ok": False, "message": "Invalid HTTP/HTTPS URL"}, HTTPStatus.BAD_REQUEST)
                     return
-                run_as_user(["xdg-open", url], background=True)
+                if IS_WINDOWS:
+                    try:
+                        os.startfile(url)
+                    except Exception as e:
+                        self._send_json({"ok": False, "message": f"Failed to open URL: {e}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                else:
+                    run_as_user(["xdg-open", url], background=True)
                 self._send_json({"ok": True, "message": f"Opening {url} on PC browser!"})
                 return
 
@@ -5291,6 +6892,29 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 preset = str(val).strip()
                 if preset not in LAUNCH_PRESETS:
                     self._send_json({"ok": False, "message": "Invalid application preset"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if IS_WINDOWS:
+                    if preset == "youtube":
+                        try:
+                            os.startfile("https://youtube.com")
+                            self._send_json({"ok": True, "message": "Launching preset: youtube"})
+                            return
+                        except Exception as e:
+                            self._send_json({"ok": False, "message": f"Launch failed: {e}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                            return
+                    win_presets = {
+                        "terminal": [["wt"], ["powershell"], ["cmd"]],
+                        "files": [["explorer.exe"]],
+                        "btop": [["btop"], ["btop4win"], ["taskmgr.exe"]],
+                    }
+                    new_con = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                    for cmd in win_presets.get(preset, []):
+                        exe = find_bin(cmd[0])
+                        if exe:
+                            subprocess.Popen([exe] + cmd[1:], env=get_desktop_env(), creationflags=new_con if preset == "terminal" else 0)
+                            self._send_json({"ok": True, "message": f"Launching preset: {preset}"})
+                            return
+                    self._send_json({"ok": False, "message": f"No Windows binary found for preset: {preset}"}, HTTPStatus.NOT_FOUND)
                     return
                 search_path = get_desktop_env()["PATH"]
                 for cmd in LAUNCH_PRESETS[preset]:
@@ -5310,6 +6934,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     return
                 if not (1 <= val_num <= 99):
                     self._send_json({"ok": False, "message": "Workspace must be between 1 and 99"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if IS_WINDOWS:
+                    self._send_json({"ok": False, "message": "Virtual desktop switching via API is not supported on Windows"}, HTTPStatus.NOT_IMPLEMENTED)
                     return
                 env = get_desktop_env()
                 comp = get_active_compositor(env)
@@ -5352,6 +6979,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     return
                 if comp == "river":
                     _LAST_RIVER_TAG = val_num
+                _invalidate_cache("workspaces_info")
                 self._send_json({"ok": True, "message": f"Switched to Workspace {val_num}"})
                 return
 
@@ -5359,6 +6987,26 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 act = str(val).strip()
                 if act not in HYPR_PRESETS:
                     self._send_json({"ok": False, "message": "Invalid window action"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if IS_WINDOWS:
+                    if act == "fullscreen":
+                        ok = _win_send_vk(0x7A)  # F11
+                    elif act == "killactive":
+                        ok = _win_send_vk(0x73, hold_alt=True)  # Alt+F4
+                    elif act == "dpms_toggle":
+                        try:
+                            ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, 2)
+                            ok = True
+                        except Exception:
+                            ok = False
+                    else:
+                        self._send_json({"ok": False, "message": f"Window action '{act}' is Linux compositor-only"}, HTTPStatus.NOT_IMPLEMENTED)
+                        return
+                    if not ok:
+                        self._send_json({"ok": False, "message": f"Window action failed: {act}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                        return
+                    _invalidate_cache("workspaces_info")
+                    self._send_json({"ok": True, "message": f"Window action: {act}"})
                     return
                 env = get_desktop_env()
                 rc, _, err = run_first_available(get_window_action_cmds(act, env))
@@ -5368,6 +7016,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                         HTTPStatus.INTERNAL_SERVER_ERROR,
                     )
                     return
+                _invalidate_cache("workspaces_info")
                 self._send_json({"ok": True, "message": f"Window action: {act}"})
                 return
 

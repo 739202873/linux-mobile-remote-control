@@ -87,10 +87,17 @@ restart_service() {
             ;;
         nohup)
             pkill -f "${install_dir}/server.py" 2>/dev/null || true
+            pkill -f "${install_dir}/mobile-rc" 2>/dev/null || true
             sleep 1
-            nohup env MRC_USER="${target_user}" "${python_bin}" "${install_dir}/server.py" >/var/log/mobile-rc.log 2>&1 &
-            sleep 1
-            pgrep -f "${install_dir}/server.py" >/dev/null 2>&1
+            if [ -x "${install_dir}/mobile-rc" ] && [ "${MRC_RUNTIME:-auto}" != "python" ]; then
+                nohup env MRC_USER="${target_user}" "${install_dir}/mobile-rc" >/var/log/mobile-rc.log 2>&1 &
+                sleep 1
+                pgrep -f "${install_dir}/mobile-rc" >/dev/null 2>&1
+            else
+                nohup env MRC_USER="${target_user}" "${python_bin}" "${install_dir}/server.py" >/var/log/mobile-rc.log 2>&1 &
+                sleep 1
+                pgrep -f "${install_dir}/server.py" >/dev/null 2>&1
+            fi
             ;;
     esac
 }
@@ -195,6 +202,18 @@ py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)
         chmod 755 /usr/local/bin/control-access
     fi
     rm -f /usr/local/bin/kontrol-laptop "${install_dir}/termux-kontrol-laptop.sh"
+    if [ "${MRC_RUNTIME:-auto}" = "rust" ] || [ "${MRC_USE_RUST:-0}" = "1" ]; then
+        if [ -x "${script_dir}/daemon-rs/target/release/mobile-rc" ]; then
+            cp -f "${script_dir}/daemon-rs/target/release/mobile-rc" "${install_dir}/mobile-rc"
+            chmod 700 "${install_dir}/mobile-rc"
+        elif [ -f "${script_dir}/daemon-rs/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+            cargo build --release --manifest-path "${script_dir}/daemon-rs/Cargo.toml" || true
+            if [ -x "${script_dir}/daemon-rs/target/release/mobile-rc" ]; then
+                cp -f "${script_dir}/daemon-rs/target/release/mobile-rc" "${install_dir}/mobile-rc"
+                chmod 700 "${install_dir}/mobile-rc"
+            fi
+        fi
+    fi
     echo -e "${GREEN}✓ Core server and CLI helper files updated.${NC}"
 
     # Migrate legacy keys cleanly, initialize termux_token / pin_mode if absent, & read metadata
