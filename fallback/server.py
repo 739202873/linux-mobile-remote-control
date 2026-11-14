@@ -5980,11 +5980,14 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/assets/control-access":
+            self_dir = os.path.dirname(os.path.abspath(__file__))
+            parent_dir = os.path.dirname(self_dir)
             script_candidates = [
                 os.path.join(CONFIG_DIR, "termux-control-access.sh"),
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "termux", "control-access"),
+                os.path.join(self_dir, "termux", "control-access"),
+                os.path.join(parent_dir, "termux", "control-access"),
                 os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    parent_dir,
                     "share",
                     "mobile-rc",
                     "termux-control-access.sh",

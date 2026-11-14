@@ -83,6 +83,7 @@ fn json_err(status: StatusCode, msg: impl AsRef<str>) -> Response {
     )
 }
 
+#[allow(clippy::result_large_err)]
 async fn read_json_object(body: Body, max_bytes: usize) -> Result<Map<String, Value>, Response> {
     let bytes = match axum::body::to_bytes(body, max_bytes).await {
         Ok(b) => b,
@@ -137,6 +138,7 @@ fn resolve_session(
     Some((tok, sess))
 }
 
+#[allow(clippy::result_large_err)]
 fn require_auth(
     state: &AppState,
     peer: IpAddr,
@@ -147,6 +149,7 @@ fn require_auth(
         .ok_or_else(|| json_err(StatusCode::UNAUTHORIZED, "Authentication required"))
 }
 
+#[allow(clippy::result_large_err)]
 fn require_csrf(sess: &SessionRecord, headers: &HeaderMap) -> Result<(), Response> {
     if sess.is_bearer {
         return Ok(());

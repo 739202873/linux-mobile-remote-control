@@ -61,7 +61,7 @@ Linux Mobile Control Center intelligently adapts its screen capture, clipboard s
 - **Installed OS Scanner & Multi-Boot Switcher:** Inspect UEFI boot entries, `systemd-boot`/`GRUB`, WSL2 distros (on Windows), Btrfs subvolumes, and optional unmounted Linux root probing, paired with safe modal-confirmed Reboot, Shutdown, Lock, Sleep, and UEFI Firmware setup.
 - **Media, Volume, Display Brightness & Remote Touchpad:** Control playback, audio volume (`wpctl`/`pactl` on Linux, Windows CoreAudio COM), display brightness (`brightnessctl`/`ddcutil`/`hyprsunset` on Linux, Windows WMI), and low-latency relative cursor/click/scroll/key injection (`ydotool`/`wtype`/`xdotool` on Linux, Win32 `user32` on Windows).
 - **On-Demand Random Code (RAC), Device Tokens & Email OTP:** Single-use 6-digit codes (`control-access`), hashed Bearer tokens for native clients, and remote SMTP Email OTP for non-local access.
-- **Hybrid Runtime Architecture (Rust + Python 3 Fallback):** `daemon-rs/` compiles into a standalone ~1.9 MiB native binary (`axum` + `tokio`, ~4.6-6.3 MB live RSS on Gentoo OpenRC), while `server.py` (strictly Python 3 Standard Library) stays bundled alongside it so any host runs out-of-the-box with zero external dependencies (`MRC_RUNTIME=auto|rust|python`).
+- **Hybrid Runtime Architecture (Rust + Python 3 Fallback):** `daemon-rs/` compiles into a standalone ~1.9 MiB native binary (`axum` + `tokio`, ~4.6-6.3 MB live RSS on Gentoo OpenRC), while `fallback/server.py` (strictly Python 3 Standard Library) stays bundled alongside it so any host runs out-of-the-box with zero external dependencies (`MRC_RUNTIME=auto|rust|python`).
 
 ---
 
@@ -71,43 +71,61 @@ Linux Mobile Control Center intelligently adapts its screen capture, clipboard s
 linux-mobile-remote-control/
 ├── .github/
 │   └── workflows/
-│       └── release.yml   # GitHub Actions release builds (Linux x86_64/aarch64 & Windows x64)
-├── daemon-rs/            # Native Rust daemon (axum + tokio)
+│       └── release.yml         # GitHub Actions release builds (Linux x86_64/aarch64 & Windows x64 + SHA256SUMS.txt)
+├── daemon-rs/                  # Native Rust daemon (axum + tokio)
 │   ├── Cargo.toml
 │   ├── Cargo.lock
 │   ├── assets/
-│   │   └── index.html    # Embedded Bento web dashboard
+│   │   └── index.html          # Embedded Bento web dashboard
 │   └── src/
-│       ├── main.rs       # Axum HTTP router, streaming I/O & UDP 8001 discovery
-│       ├── config.rs     # Settings, TTL/mtime caches & 0600 atomic storage
-│       ├── auth.rs       # RAC, sessions, CSRF, device tokens & SMTP/feedback delivery
-│       ├── telemetry.rs  # Cross-platform Linux/Windows telemetry, logs & boot entries
-│       └── actions.rs    # Shell, input/touchpad, brightness, media, power & tunnels
+│       ├── main.rs             # Axum HTTP router, streaming I/O & UDP 8001 discovery
+│       ├── config.rs           # Settings, TTL/mtime caches & 0600 atomic storage
+│       ├── auth.rs             # RAC, sessions, CSRF, device tokens & SMTP/feedback delivery
+│       ├── telemetry/
+│       │   ├── mod.rs          # Cross-platform telemetry coordinator & shared parsers
+│       │   ├── linux.rs        # Linux telemetry, /proc, logs, services & boot entries
+│       │   └── windows.rs      # Windows Win32/CoreAudio COM, Event Logs & WSL telemetry
+│       └── actions/
+│           ├── mod.rs          # Shared action validation, URL guards & SSH tunnel lifecycle
+│           ├── linux.rs        # Linux services, POSIX signals, Wayland/X11 input & screenshots
+│           └── windows.rs      # Windows services, taskkill, Win32 input & GDI+ capture
+├── fallback/
+│   └── server.py               # Python 3 stdlib HTTP daemon & fallback runtime
+├── scripts/
+│   ├── linux/
+│   │   ├── common.sh           # Shared init/user/checksum helpers for systemd, OpenRC, dinit & runit
+│   │   ├── install.sh          # Linux installer implementation
+│   │   ├── update.sh           # Linux updater implementation with runtime switching & rollback
+│   │   └── uninstall.sh        # Linux uninstaller implementation
+│   └── windows/
+│       ├── common.ps1          # Shared Task Scheduler, Firewall & SHA-256 helpers
+│       ├── install.ps1         # Windows 10/11 installer implementation
+│       ├── update.ps1          # Windows updater implementation with rollback
+│       └── uninstall.ps1       # Windows uninstaller implementation
 ├── nix/
-│   └── module.nix        # Declarative NixOS module (`services.mobile-rc`)
-├── flake.nix             # NixOS / Nix Flake package & module definition
+│   └── module.nix              # Declarative NixOS module (`services.mobile-rc`, `runtime` option)
+├── flake.nix                   # NixOS / Nix Flake package & module definition (`rust` + `python`)
 ├── bin/
-│   └── control-access    # Host CLI: random codes, Termux setup, --pair-info & Email OTP
+│   └── control-access          # Host CLI: random codes, Termux setup, --pair-info & Email OTP
 ├── termux/
-│   └── control-access    # Termux client CLI for smartphone pairing & quick login
-├── server.py             # Python 3 stdlib HTTP daemon & fallback runtime
-├── install.sh            # Universal Linux hybrid installer (systemd, OpenRC, dinit & runit)
-├── update.sh             # Safe Linux hybrid updater (updates unit/runtime & auto-rolls back)
-├── uninstall.sh          # Clean Linux uninstaller
-├── install.ps1           # Windows 10/11 hybrid installer (Scheduled Task, Firewall & control-access.cmd)
-├── update.ps1            # Safe Windows hybrid updater with auto-rollback
-├── uninstall.ps1         # Clean Windows uninstaller
-├── .gitignore            # Git exclusion rules
-├── LICENSE               # MIT License
-└── README.md             # Project documentation
+│   └── control-access          # Termux client CLI for smartphone pairing & quick login
+├── install.sh                  # Linux entrypoint wrapper (-> scripts/linux/install.sh)
+├── update.sh                   # Linux entrypoint wrapper (-> scripts/linux/update.sh)
+├── uninstall.sh                # Linux entrypoint wrapper (-> scripts/linux/uninstall.sh)
+├── install.ps1                 # Windows entrypoint wrapper (-> scripts/windows/install.ps1)
+├── update.ps1                  # Windows entrypoint wrapper (-> scripts/windows/update.ps1)
+├── uninstall.ps1               # Windows entrypoint wrapper (-> scripts/windows/uninstall.ps1)
+├── .gitignore                  # Git exclusion rules
+├── LICENSE                     # MIT License
+└── README.md                   # Project documentation
 ```
 
 ---
 
 ##  Requirements
 
-- **Python 3.8+** (Standard Library only; required for CLI tools & universal `server.py` fallback)
-- **Rust / Cargo (optional on host):** Used automatically during `install.sh` / `update.sh` / `install.ps1` / `update.ps1` when compiling `daemon-rs/` from source; when absent, installers attempt to fetch the matching prebuilt binary from GitHub Releases or fall back cleanly to `server.py`
+- **Python 3.8+** (Standard Library only; required for CLI tools & universal `fallback/server.py` runtime)
+- **Rust / Cargo (optional on host):** Used automatically during `install.sh` / `update.sh` / `install.ps1` / `update.ps1` when compiling `daemon-rs/` from source; when absent, installers fetch the matching prebuilt binary from GitHub Releases (verified against `SHA256SUMS.txt` when present) or fall back cleanly to `fallback/server.py`
 - **Screenshot capture (any of):** `grim` / `wayshot` (Wayland), `spectacle`, `gnome-screenshot`, `maim`, `scrot`, or `import` (`magick` / `convert` / Pillow optional for JPEG resizing)
 - **Window / Workspace control (depending on DE/WM):** `hyprctl`, `niri`, `qdbus6`/`qdbus`/`kdotool`, `riverctl`, `swaymsg`, `wlopm`, `wmctrl`, `xdotool`, or `xset`
 - **Audio, Backlight & Media:** `wpctl` / `pactl`, `playerctl`, `brightnessctl` / `light`
@@ -175,6 +193,7 @@ Because NixOS uses an immutable non-FHS layout, add this repository as a flake i
           services.mobile-rc = {
             enable = true;
             openFirewall = true; # opens TCP port 8000 on LAN
+            # runtime = "rust";  # "rust" (default native daemon) or "python" (stdlib fallback)
             # user = "youruser"; # optional override for MRC_USER
           };
         }
@@ -214,7 +233,7 @@ Mobile-RC uses **on-demand random 6-digit codes (RAC)** by default (codes expire
    - Useful Termux subcommands: `control-access status` (list saved URLs and email), `control-access add-url <URL>`, or `control-access <URL>`. To use a fixed PIN on local LAN instead, set `"pin_mode": "static"` in `/opt/mobile-rc/config.json` or `MRC_PIN` env var.
 
 ### 3. Over the Internet (Opt-In Tunnel / Online Email OTP)
-For security, the internet tunnel is **disabled by default**. When you explicitly start it from the rightmost **Net & Feed** tab (or set `MRC_AUTO_TUNNEL=1` / `"auto_tunnel": true` in `/opt/mobile-rc/config.json`), `server.py` opens an HTTPS tunnel (`localhost.run`) and publishes the active link to the private random notification portal generated during installation:
+For security, the internet tunnel is **disabled by default**. When you explicitly start it from the rightmost **Net & Feed** tab (or set `MRC_AUTO_TUNNEL=1` / `"auto_tunnel": true` in `/opt/mobile-rc/config.json`), the Mobile-RC daemon opens an HTTPS tunnel (`localhost.run`) and publishes the active link to the private random notification portal generated during installation:
 ```text
 https://ntfy.sh/<your-generated-topic>
 ```
@@ -249,7 +268,7 @@ Runtime configuration and secrets are stored outside the repository in `/opt/mob
 | `MRC_EMAIL_HOURLY_MAX` | `12` | Max Email OTP / feedback emails sent per hour (min `3`) |
 | `MRC_FEEDBACK_EMAIL` | `brypra4@gmail.com` | Destination inbox for Feedback & Bug Report form when using local SMTP |
 | `MRC_FEEDBACK_WEBHOOK` | *(unset)* | Optional HTTPS webhook URL (e.g. Web3Forms/Formspree) for zero-SMTP feedback relay |
-| `MRC_RUNTIME` | `auto` | Runtime engine selection: `auto` (use/build native Rust binary if available, else Python `server.py`), `rust`, or `python` |
+| `MRC_RUNTIME` | `auto` | Runtime engine selection: `auto` (use/build native Rust binary if available, else `fallback/server.py`), `rust`, or `python` |
 | `MRC_DISCOVERY` | `1` | Set to `0` to disable background LAN UDP auto-discovery listener |
 
 ---
@@ -272,13 +291,13 @@ sudo control-access --restart        # restart service
 
 ##  Updating
 
-To pull the latest updates, resolve the active hybrid runtime (native Rust binary when available, or Python `server.py` fallback), and safely restart the background service while preserving your existing PIN, configuration, and SSH keys:
+To pull the latest updates, resolve the active hybrid runtime (native Rust binary when available, or `fallback/server.py`), and safely restart the background service while preserving your existing PIN, configuration, and SSH keys:
 ```bash
 sudo ./update.sh
 ```
 To explicitly switch runtimes on an existing installation:
 ```bash
-sudo MRC_RUNTIME=python ./update.sh --no-pull   # switch service launcher to server.py
+sudo MRC_RUNTIME=python ./update.sh --no-pull   # switch service launcher to Python fallback (server.py)
 sudo MRC_RUNTIME=rust ./update.sh --no-pull     # build/install and activate native mobile-rc
 ```
 

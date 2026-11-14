@@ -3,7 +3,11 @@ self:
 
 let
   cfg = config.services.mobile-rc;
-  mobileRcPkg = self.packages.${pkgs.stdenv.hostPlatform.system}.mobile-rc;
+  pkgsForSystem = self.packages.${pkgs.stdenv.hostPlatform.system};
+  mobileRcPkg =
+    if cfg.runtime == "python"
+    then pkgsForSystem.mobile-rc-python
+    else pkgsForSystem.mobile-rc;
 
   controlAccessPkg = pkgs.runCommand "mobile-rc-control-access"
     {
@@ -19,6 +23,12 @@ in
 {
   options.services.mobile-rc = {
     enable = lib.mkEnableOption "Linux Mobile Control Center (Mobile-RC) remote dashboard";
+
+    runtime = lib.mkOption {
+      type = lib.types.enum [ "rust" "python" ];
+      default = "rust";
+      description = "Daemon runtime backend: native Rust binary ('rust') or Python 3 stdlib fallback ('python').";
+    };
 
     port = lib.mkOption {
       type = lib.types.port;

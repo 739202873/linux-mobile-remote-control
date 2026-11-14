@@ -535,6 +535,29 @@ def _service_state(mode):
     return running, autostart
 
 
+def _runtime_marker_path():
+    return os.path.join(os.path.dirname(CONFIG_FILE), ".runtime")
+
+
+def _configured_runtime_cmd():
+    """Resolve preferred runtime command, honoring .runtime marker when present."""
+    marker_file = _runtime_marker_path()
+    pref = ""
+    try:
+        if os.path.isfile(marker_file):
+            with open(marker_file, "r", encoding="utf-8") as f:
+                pref = f.read().strip().lower()
+    except OSError:
+        pref = ""
+    if pref == "python" and os.path.isfile("/opt/mobile-rc/server.py"):
+        return [sys.executable, "/opt/mobile-rc/server.py"], "python"
+    if pref == "rust" and os.access("/opt/mobile-rc/mobile-rc", os.X_OK):
+        return ["/opt/mobile-rc/mobile-rc"], "rust"
+    if os.access("/opt/mobile-rc/mobile-rc", os.X_OK):
+        return ["/opt/mobile-rc/mobile-rc"], "rust"
+    return [sys.executable, "/opt/mobile-rc/server.py"], "python"
+
+
 def print_service_status():
     mode = _detect_init_mode()
     running, autostart = _service_state(mode)
@@ -546,6 +569,10 @@ def print_service_status():
     )
     print(f"Service Status : {run_lbl} (init: {mode})")
     print(f"Boot Auto-Start: {auto_lbl}")
+    if not IS_WINDOWS and os.path.isfile(_runtime_marker_path()):
+        _, rt_name = _configured_runtime_cmd()
+        rt_lbl = "Native Rust (/opt/mobile-rc/mobile-rc)" if rt_name == "rust" else "Python 3 (/opt/mobile-rc/server.py)"
+        print(f"Runtime Engine : {CYAN}{rt_lbl}{NC}")
 
 
 def _require_root_for_service(flag_name):
@@ -675,7 +702,7 @@ def manage_runtime_service(action):
                         env["MRC_USER"] = t_user
                 except Exception:
                     pass
-            bin_cmd = ["/opt/mobile-rc/mobile-rc"] if os.access("/opt/mobile-rc/mobile-rc", os.X_OK) else [sys.executable, "/opt/mobile-rc/server.py"]
+            bin_cmd, _ = _configured_runtime_cmd()
             with open("/var/log/mobile-rc.log", "ab") as logf:
                 subprocess.Popen(
                     bin_cmd,
