@@ -97,30 +97,45 @@ try {
 } catch {}
 
 # Metode C: Hybrid native Rust resolution (falls back cleanly to server.py)
-$UseRust = ($Runtime -eq "rust") -or ($env:MRC_USE_RUST -eq "1")
+$UseRust = ($Runtime -in @("auto", "rust")) -and ($env:MRC_USE_RUST -ne "0")
+if (-not $env:MRC_RUNTIME -and ($env:MRC_USE_RUST -eq "1")) { $UseRust = $true }
 $TaskExe = $PythonExe
 $TaskArg = "`"$InstallDir\server.py`""
 $RustOut = Join-Path $InstallDir "mobile-rc.exe"
 
 if ($UseRust) {
+    Stop-ScheduledTask -TaskName "Mobile-RC" -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*Mobile-RC\server.py*" -or $_.ExecutablePath -like "*Mobile-RC\mobile-rc.exe" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 400
+
     $LocalRust = Join-Path $ScriptDir "daemon-rs\target\release\mobile-rc.exe"
     $CargoToml = Join-Path $ScriptDir "daemon-rs\Cargo.toml"
-    if (Test-Path $LocalRust) {
-        Copy-Item $LocalRust $RustOut -Force
-    } elseif ((Test-Path $CargoToml) -and (Get-Command "cargo" -ErrorAction SilentlyContinue)) {
-        Write-Host "   Building native Rust daemon..." -ForegroundColor Blue
+    $RustReady = $false
+    if ((Test-Path $CargoToml) -and (Get-Command "cargo" -ErrorAction SilentlyContinue)) {
+        Write-Host "   Building native Rust daemon (cargo build --release)..." -ForegroundColor Blue
         try { & cargo build --release --manifest-path $CargoToml } catch {}
-        if (Test-Path $LocalRust) { Copy-Item $LocalRust $RustOut -Force }
-    } else {
+        if (Test-Path $LocalRust) {
+            Copy-Item $LocalRust $RustOut -Force
+            $RustReady = $true
+        }
+    }
+    if (-not $RustReady -and (Test-Path $LocalRust)) {
+        Copy-Item $LocalRust $RustOut -Force
+        $RustReady = $true
+    }
+    if (-not $RustReady) {
         try {
             $dlUrl = "https://github.com/739202873/linux-mobile-remote-control/releases/latest/download/mobile-rc-windows-x86_64.exe"
-            Invoke-WebRequest -Uri $dlUrl -OutFile "$RustOut.tmp" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+            Invoke-WebRequest -Uri $dlUrl -OutFile "$RustOut.tmp" -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
             Move-Item "$RustOut.tmp" $RustOut -Force
+            $RustReady = $true
         } catch {
             Remove-Item "$RustOut.tmp" -Force -ErrorAction SilentlyContinue
         }
     }
-    if (Test-Path $RustOut) {
+    if ($RustReady -and (Test-Path $RustOut)) {
         $TaskExe = $RustOut
         $TaskArg = ""
         Write-Host "   Using Hybrid native runtime: $RustOut" -ForegroundColor Green

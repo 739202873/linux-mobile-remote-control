@@ -10,3 +10,4 @@ ssh_id_ed25519*
 ssh_known_hosts
 /tmp/
 /mobile-app/
+/daemon-rs/target/

@@ -50,11 +50,137 @@ print_lan_urls() {
     fi
 }
 
-restart_service() {
-    local python_bin="$1"
+resolve_service_file() {
+    local mode="$1"
+    case "${mode}" in
+        systemd) echo "/etc/systemd/system/mobile-rc.service" ;;
+        openrc)  echo "/etc/init.d/mobile-rc" ;;
+        dinit)   echo "/etc/dinit.d/mobile-rc" ;;
+        runit)
+            local svc_link="" real_dir=""
+            for d in /var/service /run/runit/service /etc/service; do
+                if [ -e "${d}/mobile-rc" ]; then
+                    svc_link="${d}/mobile-rc"
+                    break
+                fi
+            done
+            if [ -n "${svc_link}" ]; then
+                real_dir="$(readlink -f "${svc_link}" 2>/dev/null || echo "${svc_link}")"
+                echo "${real_dir}/run"
+            fi
+            ;;
+        *) echo "" ;;
+    esac
+}
+
+stop_service() {
+    local mode="$1"
     local install_dir="$2"
-    local target_user="$3"
-    local mode="$4"
+    case "${mode}" in
+        systemd)
+            systemctl stop mobile-rc.service >/dev/null 2>&1 || true
+            ;;
+        openrc)
+            rc-service mobile-rc stop >/dev/null 2>&1 || true
+            ;;
+        dinit)
+            dinitctl stop mobile-rc >/dev/null 2>&1 || true
+            ;;
+        runit)
+            local svc_link=""
+            for d in /var/service /run/runit/service /etc/service; do
+                if [ -e "${d}/mobile-rc" ]; then
+                    svc_link="${d}/mobile-rc"
+                    break
+                fi
+            done
+            [ -n "${svc_link}" ] && sv down "${svc_link}" >/dev/null 2>&1 || true
+            ;;
+        nohup)
+            pkill -f "${install_dir}/server.py" 2>/dev/null || true
+            pkill -f "${install_dir}/mobile-rc" 2>/dev/null || true
+            ;;
+    esac
+    sleep 1
+}
+
+write_service_unit() {
+    local mode="$1"
+    local runtime_bin="$2"
+    local runtime_args="$3"
+    local target_user="$4"
+    local runtime_cmd="${runtime_bin}${runtime_args:+ ${runtime_args}}"
+
+    case "${mode}" in
+        systemd)
+            cat << EOF > /etc/systemd/system/mobile-rc.service
+[Unit]
+Description=Mobile-RC Remote Control Center
+After=network.target network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment="MRC_USER=${target_user}"
+ExecStart=${runtime_cmd}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            ;;
+        openrc)
+            cat << EOF > /etc/init.d/mobile-rc
+#!/sbin/openrc-run
+name="Mobile-RC"
+description="Universal Cross-Platform Remote Web Dashboard"
+command="${runtime_bin}"
+command_args="${runtime_args}"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+export MRC_USER="${target_user}"
+
+depend() {
+    need net
+}
+EOF
+            chmod 755 /etc/init.d/mobile-rc
+            ;;
+        dinit)
+            local env_bin
+            env_bin="$(command -v env || echo /usr/bin/env)"
+            cat << EOF > /etc/dinit.d/mobile-rc
+type = process
+command = ${env_bin} MRC_USER=${target_user} ${runtime_cmd}
+restart = true
+smooth-recovery = true
+logfile = /var/log/mobile-rc.log
+EOF
+            chmod 644 /etc/dinit.d/mobile-rc
+            ;;
+        runit)
+            local run_file
+            run_file="$(resolve_service_file runit)"
+            [ -n "${run_file}" ] || return 1
+            cat << EOF > "${run_file}"
+#!/bin/sh
+exec 2>&1
+export MRC_USER="${target_user}"
+exec ${runtime_cmd} >>/var/log/mobile-rc.log
+EOF
+            chmod 755 "${run_file}"
+            ;;
+    esac
+}
+
+restart_service() {
+    local runtime_bin="$1"
+    local runtime_args="$2"
+    local install_dir="$3"
+    local target_user="$4"
+    local mode="$5"
 
     case "${mode}" in
         systemd)
@@ -63,12 +189,12 @@ restart_service() {
             systemctl is-active --quiet mobile-rc.service
             ;;
         openrc)
-            rc-service mobile-rc restart
+            rc-service mobile-rc restart 2>/dev/null || rc-service mobile-rc start
             sleep 1
             rc-service mobile-rc status >/dev/null 2>&1
             ;;
         dinit)
-            dinitctl restart mobile-rc
+            dinitctl restart mobile-rc 2>/dev/null || dinitctl start mobile-rc
             sleep 1
             dinitctl status mobile-rc 2>/dev/null | grep -qiE "started|running"
             ;;
@@ -81,7 +207,7 @@ restart_service() {
                 fi
             done
             [ -n "${svc_link}" ] || return 1
-            sv restart "${svc_link}"
+            sv restart "${svc_link}" 2>/dev/null || sv up "${svc_link}"
             sleep 1
             sv status "${svc_link}" 2>/dev/null | grep -q "^run:"
             ;;
@@ -89,17 +215,39 @@ restart_service() {
             pkill -f "${install_dir}/server.py" 2>/dev/null || true
             pkill -f "${install_dir}/mobile-rc" 2>/dev/null || true
             sleep 1
-            if [ -x "${install_dir}/mobile-rc" ] && [ "${MRC_RUNTIME:-auto}" != "python" ]; then
-                nohup env MRC_USER="${target_user}" "${install_dir}/mobile-rc" >/var/log/mobile-rc.log 2>&1 &
-                sleep 1
-                pgrep -f "${install_dir}/mobile-rc" >/dev/null 2>&1
-            else
-                nohup env MRC_USER="${target_user}" "${python_bin}" "${install_dir}/server.py" >/var/log/mobile-rc.log 2>&1 &
+            if [ -n "${runtime_args}" ]; then
+                nohup env MRC_USER="${target_user}" "${runtime_bin}" "${runtime_args}" >/var/log/mobile-rc.log 2>&1 &
                 sleep 1
                 pgrep -f "${install_dir}/server.py" >/dev/null 2>&1
+            else
+                nohup env MRC_USER="${target_user}" "${runtime_bin}" >/var/log/mobile-rc.log 2>&1 &
+                sleep 1
+                pgrep -f "${install_dir}/mobile-rc" >/dev/null 2>&1
             fi
             ;;
     esac
+}
+
+build_rust_as_owner() {
+    local owner_user="$1"
+    local manifest="$2"
+    local cargo_path=""
+    if [ -n "${owner_user}" ] && [ "${owner_user}" != "root" ]; then
+        local owner_home=""
+        owner_home="$(getent passwd "${owner_user}" 2>/dev/null | cut -d: -f6 || true)"
+        local extra_path="${PATH}${owner_home:+:${owner_home}/.cargo/bin}"
+        cargo_path="$(run_as_repo_owner "${owner_user}" env PATH="${extra_path}" sh -c 'command -v cargo 2>/dev/null || true' || true)"
+        if [ -n "${cargo_path}" ]; then
+            run_as_repo_owner "${owner_user}" env PATH="${extra_path}" "${cargo_path}" build --release --manifest-path "${manifest}"
+            return $?
+        fi
+    fi
+    cargo_path="$(command -v cargo 2>/dev/null || true)"
+    if [ -n "${cargo_path}" ]; then
+        "${cargo_path}" build --release --manifest-path "${manifest}"
+        return $?
+    fi
+    return 1
 }
 
 main() {
@@ -202,17 +350,80 @@ py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)
         chmod 755 /usr/local/bin/control-access
     fi
     rm -f /usr/local/bin/kontrol-laptop "${install_dir}/termux-kontrol-laptop.sh"
-    if [ "${MRC_RUNTIME:-auto}" = "rust" ] || [ "${MRC_USE_RUST:-0}" = "1" ]; then
-        if [ -x "${script_dir}/daemon-rs/target/release/mobile-rc" ]; then
-            cp -f "${script_dir}/daemon-rs/target/release/mobile-rc" "${install_dir}/mobile-rc"
-            chmod 700 "${install_dir}/mobile-rc"
-        elif [ -f "${script_dir}/daemon-rs/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
-            cargo build --release --manifest-path "${script_dir}/daemon-rs/Cargo.toml" || true
+
+    local runtime_mode="${MRC_RUNTIME:-auto}"
+    if [ -z "${MRC_RUNTIME:-}" ]; then
+        [ "${MRC_USE_RUST:-}" = "0" ] && runtime_mode="python"
+        [ "${MRC_USE_RUST:-}" = "1" ] && runtime_mode="rust"
+    fi
+
+    local had_old_rust=0
+    if [ -x "${install_dir}/mobile-rc" ]; then
+        had_old_rust=1
+        cp -f "${install_dir}/mobile-rc" "${install_dir}/mobile-rc.bak" 2>/dev/null || true
+        [ -f "${install_dir}/mobile-rc.bak" ] && chmod 700 "${install_dir}/mobile-rc.bak"
+    fi
+
+    local runtime_bin="${python_bin}"
+    local runtime_args="${install_dir}/server.py"
+    local active_runtime_label="Python 3 (${install_dir}/server.py)"
+    local rust_ready=0
+
+    if [ "${runtime_mode}" != "python" ]; then
+        if [ -f "${script_dir}/daemon-rs/Cargo.toml" ]; then
+            echo -e "${BLUE}   Checking native Rust daemon build...${NC}"
+            build_rust_as_owner "${caller_user}" "${script_dir}/daemon-rs/Cargo.toml" || true
             if [ -x "${script_dir}/daemon-rs/target/release/mobile-rc" ]; then
-                cp -f "${script_dir}/daemon-rs/target/release/mobile-rc" "${install_dir}/mobile-rc"
-                chmod 700 "${install_dir}/mobile-rc"
+                cp -f "${script_dir}/daemon-rs/target/release/mobile-rc" "${install_dir}/mobile-rc.new"
+                chmod 700 "${install_dir}/mobile-rc.new"
+                mv -f "${install_dir}/mobile-rc.new" "${install_dir}/mobile-rc"
+                rust_ready=1
             fi
         fi
+        if [ "${rust_ready}" -eq 0 ] && [ -x "${script_dir}/daemon-rs/target/release/mobile-rc" ]; then
+            cp -f "${script_dir}/daemon-rs/target/release/mobile-rc" "${install_dir}/mobile-rc.new"
+            chmod 700 "${install_dir}/mobile-rc.new"
+            mv -f "${install_dir}/mobile-rc.new" "${install_dir}/mobile-rc"
+            rust_ready=1
+        fi
+        if [ "${rust_ready}" -eq 0 ] && command -v curl >/dev/null 2>&1; then
+            local arch_raw rust_asset=""
+            arch_raw="$(uname -m)"
+            case "${arch_raw}" in
+                x86_64|amd64) rust_asset="mobile-rc-linux-x86_64" ;;
+                aarch64|arm64) rust_asset="mobile-rc-linux-aarch64" ;;
+            esac
+            if [ -n "${rust_asset}" ]; then
+                curl -fsSL --connect-timeout 8 --max-time 25 \
+                    "https://github.com/739202873/linux-mobile-remote-control/releases/latest/download/${rust_asset}" \
+                    -o "${install_dir}/mobile-rc.tmp" 2>/dev/null \
+                    && chmod 700 "${install_dir}/mobile-rc.tmp" \
+                    && mv -f "${install_dir}/mobile-rc.tmp" "${install_dir}/mobile-rc" \
+                    && rust_ready=1 \
+                    || rm -f "${install_dir}/mobile-rc.tmp"
+            fi
+        fi
+        if [ "${rust_ready}" -eq 1 ] && [ -x "${install_dir}/mobile-rc" ]; then
+            runtime_bin="${install_dir}/mobile-rc"
+            runtime_args=""
+            active_runtime_label="Native Rust (${runtime_bin})"
+            echo -e "${GREEN}   Hybrid native runtime prepared: ${runtime_bin}${NC}"
+        elif [ "${runtime_mode}" = "rust" ]; then
+            echo -e "${RED}Error: MRC_RUNTIME=rust was explicitly requested, but native binary build/download failed.${NC}"
+            if [ -f "${install_dir}/server.py.bak" ]; then
+                mv -f "${install_dir}/server.py.bak" "${install_dir}/server.py"
+                chmod 700 "${install_dir}/server.py"
+            fi
+            if [ "${had_old_rust}" -eq 1 ] && [ -f "${install_dir}/mobile-rc.bak" ]; then
+                mv -f "${install_dir}/mobile-rc.bak" "${install_dir}/mobile-rc"
+                chmod 700 "${install_dir}/mobile-rc"
+            fi
+            exit 1
+        else
+            echo -e "${YELLOW}   Native Rust binary unavailable; using Python server.py runtime.${NC}"
+        fi
+    else
+        echo -e "${BLUE}   MRC_RUNTIME=python requested; keeping Python server.py runtime.${NC}"
     fi
     echo -e "${GREEN}✓ Core server and CLI helper files updated.${NC}"
 
@@ -303,18 +514,46 @@ PYEOF
         svc_mode="runit"
     fi
 
-    if ! restart_service "${python_bin}" "${install_dir}" "${target_user}" "${svc_mode}"; then
+    local svc_file=""
+    svc_file="$(resolve_service_file "${svc_mode}")"
+    if [ -n "${svc_file}" ] && [ -f "${svc_file}" ]; then
+        cp -f "${svc_file}" "${svc_file}.bak" 2>/dev/null || true
+    fi
+
+    stop_service "${svc_mode}" "${install_dir}"
+    if [ "${svc_mode}" != "nohup" ]; then
+        write_service_unit "${svc_mode}" "${runtime_bin}" "${runtime_args}" "${target_user}"
+    fi
+
+    if ! restart_service "${runtime_bin}" "${runtime_args}" "${install_dir}" "${target_user}" "${svc_mode}"; then
         echo -e "${RED}Error: Mobile-RC failed to stay running after update! Rolling back...${NC}"
+        stop_service "${svc_mode}" "${install_dir}"
         if [ -f "${install_dir}/server.py.bak" ]; then
             mv -f "${install_dir}/server.py.bak" "${install_dir}/server.py"
             chmod 700 "${install_dir}/server.py"
-            restart_service "${python_bin}" "${install_dir}" "${target_user}" "${svc_mode}" || true
+        fi
+        if [ "${had_old_rust}" -eq 1 ] && [ -f "${install_dir}/mobile-rc.bak" ]; then
+            mv -f "${install_dir}/mobile-rc.bak" "${install_dir}/mobile-rc"
+            chmod 700 "${install_dir}/mobile-rc"
+        else
+            rm -f "${install_dir}/mobile-rc" "${install_dir}/mobile-rc.bak"
+        fi
+        if [ -n "${svc_file}" ] && [ -f "${svc_file}.bak" ]; then
+            mv -f "${svc_file}.bak" "${svc_file}"
+            [ "${svc_mode}" = "openrc" ] || [ "${svc_mode}" = "runit" ] && chmod 755 "${svc_file}" || true
+            [ "${svc_mode}" = "systemd" ] && systemctl daemon-reload || true
+        fi
+        if [ "${had_old_rust}" -eq 1 ] && [ -x "${install_dir}/mobile-rc" ]; then
+            restart_service "${install_dir}/mobile-rc" "" "${install_dir}" "${target_user}" "${svc_mode}" || true
+        else
+            restart_service "${python_bin}" "${install_dir}/server.py" "${install_dir}" "${target_user}" "${svc_mode}" || true
         fi
         exit 1
     fi
 
-    rm -f "${install_dir}/server.py.bak"
-    echo -e "${GREEN}✓ Mobile-RC restarted (${svc_mode}) and verified running.${NC}"
+    rm -f "${install_dir}/server.py.bak" "${install_dir}/mobile-rc.bak"
+    [ -n "${svc_file}" ] && rm -f "${svc_file}.bak"
+    echo -e "${GREEN}✓ Mobile-RC restarted (${svc_mode}, ${active_runtime_label}) and verified running.${NC}"
 
     rm -f /tmp/mrc_raw.png /tmp/mrc_live_shot.jpg 2>/dev/null || true
 
@@ -322,6 +561,7 @@ PYEOF
     echo -e "\n${CYAN}====================================================${NC}"
     echo -e "${GREEN}   ✅ Mobile-RC has been successfully updated!      ${NC}"
     echo -e "${CYAN}====================================================${NC}"
+    echo -e " Runtime Engine           : ${CYAN}${active_runtime_label}${NC}"
     echo -e " 🔑 Access Code Mode       : ${YELLOW}${pin_mode} (${pin_val})${NC}"
     echo -e " 💻 Generate Code on PC    : ${CYAN}sudo control-access${NC}"
     echo -e " 📱 Show Termux Setup Cmd  : ${CYAN}sudo control-access --setup-termux${NC}"

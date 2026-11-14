@@ -1,0 +1,2048 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#070b14">
+<title>Mobile-RC • Control Center</title>
+<style>
+  :root {
+    --bg: #070b14;
+    --bg-elev: #0d1424;
+    --card: rgba(15, 23, 42, 0.88);
+    --card-inner: rgba(2, 6, 23, 0.48);
+    --border: rgba(148, 163, 184, 0.14);
+    --border-strong: rgba(148, 163, 184, 0.24);
+    --accent: #38bdf8;
+    --accent-soft: rgba(56, 189, 248, 0.14);
+    --accent2: #818cf8;
+    --text: #f8fafc;
+    --muted: #94a3b8;
+    --danger: #ef4444;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Inter, sans-serif; -webkit-tap-highlight-color: transparent; }
+  body {
+    background: radial-gradient(circle at 12% 8%, rgba(56,189,248,0.10), transparent 36%),
+                radial-gradient(circle at 88% 85%, rgba(129,140,248,0.08), transparent 38%),
+                var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .num { font-variant-numeric: tabular-nums; }
+  .svg-ic { width: 18px; height: 18px; flex-shrink: 0; display: inline-block; vertical-align: middle; }
+  .svg-sm { width: 15px; height: 15px; flex-shrink: 0; display: inline-block; vertical-align: middle; }
+
+  .app-shell { display: flex; min-height: 100vh; width: 100%; }
+  .sidebar-rail {
+    display: none;
+    width: 224px;
+    flex-shrink: 0;
+    background: rgba(9, 14, 27, 0.96);
+    border-right: 1px solid var(--border);
+    padding: 18px 12px;
+    flex-direction: column;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    z-index: 30;
+  }
+  .sidebar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+  }
+  .brand-logo {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, rgba(56,189,248,0.22), rgba(129,140,248,0.22));
+    border: 1px solid rgba(56,189,248,0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--accent);
+  }
+  .sidebar-links { display: flex; flex-direction: column; gap: 4px; }
+  .sidebar-rail .nav-item {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 11px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid transparent;
+    width: 100%;
+    text-align: left;
+  }
+  .sidebar-rail .nav-item:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+  .sidebar-rail .nav-item.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-color: rgba(56,189,248,0.28);
+  }
+  .sidebar-footer { padding-top: 12px; border-top: 1px solid var(--border); }
+
+  .main-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .container { width: 100%; max-width: 1260px; margin: 0 auto; padding: 14px 14px 92px; }
+
+  @media (min-width: 768px) {
+    .sidebar-rail { display: flex; }
+    .bottom-nav { display: none !important; }
+    .container { padding: 20px 24px 32px; }
+  }
+
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    padding: 4px 2px 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+  }
+  .os-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(56,189,248,0.12);
+    color: var(--accent);
+    border: 1px solid rgba(56,189,248,0.28);
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.2px;
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 8px var(--success);
+    display: inline-block;
+  }
+  .title { font-size: 20px; font-weight: 800; letter-spacing: -0.35px; margin-top: 4px; }
+  .subtitle { font-size: 12px; color: var(--muted); }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 15px;
+    margin-bottom: 14px;
+    box-shadow: 0 10px 30px rgba(2, 6, 23, 0.35);
+    min-width: 0;
+  }
+  .card-title {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    color: var(--muted);
+    font-weight: 700;
+    margin-bottom: 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .card-title-left { display: inline-flex; align-items: center; gap: 7px; color: #cbd5e1; }
+
+  .bento-metrics {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+  @media (min-width: 1024px) {
+    .bento-metrics { grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  }
+  .bento-2col { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  @media (min-width: 1024px) {
+    .bento-2col { grid-template-columns: 1.35fr 1fr; align-items: start; }
+  }
+  .bento-pair { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  @media (min-width: 900px) {
+    .bento-pair { grid-template-columns: repeat(2, 1fr); align-items: start; }
+  }
+
+  .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 9px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; }
+
+  .stat-box {
+    background: var(--card);
+    border: 1px solid var(--border);
+    padding: 13px;
+    border-radius: 14px;
+    min-width: 0;
+  }
+  .stat-label { font-size: 11px; color: var(--muted); font-weight: 700; letter-spacing: 0.4px; }
+  .stat-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin: 4px 0 6px; }
+  .stat-val { font-size: 20px; font-weight: 800; color: var(--text); }
+  .bar-bg { height: 5px; background: rgba(255,255,255,0.07); border-radius: 99px; overflow: hidden; }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 99px; transition: width 0.35s ease; }
+  .spark-wrap { width: 100%; height: 28px; margin-top: 7px; opacity: 0.92; }
+  .spark-wrap svg { width: 100%; height: 100%; display: block; }
+
+  button {
+    background: rgba(255,255,255,0.055);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    padding: 10px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.14s ease, border-color 0.14s ease, transform 0.1s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  button:hover { background: rgba(255,255,255,0.09); border-color: var(--border-strong); }
+  button:active { transform: scale(0.97); }
+  button:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn-sm { padding: 5px 10px; font-size: 11px; border-radius: 8px; }
+  .btn-primary { background: linear-gradient(135deg, #0ea5e9, #6366f1); border-color: transparent; color: #fff; }
+  .btn-primary:hover { filter: brightness(1.08); background: linear-gradient(135deg, #0ea5e9, #6366f1); }
+  .btn-danger { background: rgba(239,68,68,0.14); border-color: rgba(239,68,68,0.34); color: #fca5a5; }
+  .btn-danger:hover { background: rgba(239,68,68,0.24); }
+  .btn-success { background: rgba(16,185,129,0.14); border-color: rgba(16,185,129,0.34); color: #6ee7b7; }
+  .btn-warn { background: rgba(245,158,11,0.14); border-color: rgba(245,158,11,0.35); color: #fcd34d; }
+
+  .btn-os { justify-content: space-between; padding: 13px 14px; font-size: 13px; text-align: left; }
+  .btn-arch { border-color: rgba(23,147,209,0.45); background: rgba(23,147,209,0.12); color: #7dd3fc; }
+  .btn-cachyos { border-color: rgba(20,184,166,0.45); background: rgba(20,184,166,0.12); color: #5eead4; }
+  .btn-garuda { border-color: rgba(245,158,11,0.45); background: rgba(245,158,11,0.12); color: #fcd34d; }
+  .btn-gentoo { border-color: rgba(168,85,247,0.45); background: rgba(168,85,247,0.12); color: #d8b4fe; }
+  .btn-nixos { border-color: rgba(96,165,250,0.45); background: rgba(96,165,250,0.12); color: #93c5fd; }
+
+  .shot-wrap {
+    position: relative;
+    background: #020617;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    min-height: 200px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+  .shot-wrap img { width: 100%; height: auto; display: block; object-fit: contain; max-height: 430px; }
+  .shot-placeholder { color: var(--muted); font-size: 12px; padding: 28px; text-align: center; }
+
+  input[type="range"] { width: 100%; accent-color: var(--accent); height: 6px; margin: 10px 0; background: transparent; cursor: pointer; }
+  input[type="text"], input[type="email"], input[type="password"], select, textarea {
+    width: 100%;
+    background: rgba(2, 6, 23, 0.72);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 12px;
+    border-radius: 10px;
+    outline: none;
+    font-size: 13px;
+  }
+  select.compact-sel { width: auto; padding: 4px 8px; font-size: 11px; border-radius: 8px; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+
+  .badge-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    background: rgba(148,163,184,0.13);
+    color: #cbd5e1;
+    border: 1px solid var(--border);
+  }
+  .pill-ok { background: rgba(16,185,129,0.14); color: #6ee7b7; border-color: rgba(16,185,129,0.3); }
+  .pill-err { background: rgba(239,68,68,0.14); color: #fca5a5; border-color: rgba(239,68,68,0.3); }
+  .pill-warn { background: rgba(245,158,11,0.14); color: #fcd34d; border-color: rgba(245,158,11,0.3); }
+
+  .row-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    background: var(--card-inner);
+    border: 1px solid rgba(148,163,184,0.08);
+    border-radius: 10px;
+    margin-bottom: 6px;
+  }
+  .row-item-col { min-width: 0; flex: 1; }
+  .row-title { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-sub { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .scroll-box {
+    max-height: 360px;
+    overflow-y: auto;
+    background: rgba(2, 6, 23, 0.52);
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    padding: 6px;
+  }
+  .log-line {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    padding: 5px 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    word-break: break-word;
+  }
+  .log-err { color: #fca5a5; background: rgba(239,68,68,0.08); }
+  .log-warn { color: #fde68a; background: rgba(245,158,11,0.07); }
+  .log-info { color: #cbd5e1; }
+
+  .touchpad-box {
+    background: linear-gradient(180deg, rgba(15,23,42,0.9), rgba(2,6,23,0.95));
+    border: 1px dashed rgba(56,189,248,0.38);
+    border-radius: 14px;
+    height: 160px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    touch-action: none;
+    user-select: none;
+    cursor: crosshair;
+    margin-bottom: 9px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .term {
+    background: #020617;
+    border: 1px solid var(--border);
+    padding: 10px;
+    border-radius: 10px;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: #93c5fd;
+    max-height: 185px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin-top: 8px;
+  }
+
+  .tab-pane { display: none; animation: fadeIn 0.16s ease; }
+  .tab-pane.active { display: block; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+  .bottom-nav {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: rgba(7, 11, 20, 0.94);
+    backdrop-filter: blur(14px);
+    border-top: 1px solid var(--border);
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
+    z-index: 40;
+  }
+  .bottom-nav .nav-item {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    padding: 5px 2px;
+    font-size: 10px;
+    font-weight: 600;
+    border-radius: 9px;
+  }
+  .bottom-nav .nav-item.active { color: var(--accent); background: rgba(56,189,248,0.1); }
+
+  #toast {
+    position: fixed;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-85px);
+    background: #0f172a;
+    border: 1px solid var(--accent);
+    color: #fff;
+    padding: 9px 18px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    z-index: 120;
+    transition: transform 0.25s ease;
+    box-shadow: 0 12px 30px rgba(0,0,0,0.6);
+    pointer-events: none;
+    max-width: 90vw;
+    text-align: center;
+  }
+  #toast.show { transform: translateX(-50%) translateY(0); }
+
+  .overlay-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(4, 7, 15, 0.92);
+    backdrop-filter: blur(14px);
+    z-index: 100;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+  }
+  .modal-card {
+    width: 100%;
+    max-width: 390px;
+    background: #0f172a;
+    border: 1px solid var(--border-strong);
+    border-radius: 20px;
+    padding: 22px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.7);
+  }
+  .shot-modal-inner {
+    width: 100%;
+    max-width: 1120px;
+    max-height: 92vh;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .shot-modal-inner img {
+    width: 100%;
+    max-height: 82vh;
+    object-fit: contain;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: #020617;
+  }
+  .login-err { color: #fca5a5; font-size: 12px; min-height: 18px; margin: 8px 0 6px; text-align: center; }
+</style>
+</head>
+<body>
+
+<div id="toast"></div>
+
+<div id="login-overlay" class="overlay-modal">
+  <div class="modal-card" style="text-align:center">
+    <div class="os-badge" style="margin-bottom:10px"><span class="dot"></span> <span id="login-badge-text">Mobile-RC Locked</span></div>
+    <div class="title" style="margin-bottom:6px">Enter Access Code</div>
+    <div class="subtitle" id="login-hint" style="margin-bottom:14px">Run <code>sudo control-access</code> on your PC/Laptop and enter the 6-digit RAC below.</div>
+    <div id="email-otp-box" style="display:none;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)">
+      <input type="email" id="email-input" placeholder="Registered email address" autocomplete="email" style="margin-bottom:8px" onkeydown="handleEmailKey(event)">
+      <button id="send-email-btn" onclick="requestEmailCode()" style="width:100%;margin-bottom:6px">Send Code to Email</button>
+      <div id="email-otp-status" class="subtitle" style="min-height:16px"></div>
+    </div>
+    <input type="password" id="pin-input" inputmode="numeric" maxlength="16" placeholder="6-digit RAC" autocomplete="one-time-code" style="text-align:center;font-size:18px;letter-spacing:4px;margin-bottom:6px" oninput="onPinInput(this)" onkeydown="handlePinKey(event)">
+    <div class="login-err" id="login-err"></div>
+    <button class="btn-primary" style="width:100%" onclick="submitLogin()">Unlock Dashboard</button>
+  </div>
+</div>
+
+<div id="power-modal" class="overlay-modal">
+  <div class="modal-card">
+    <div class="title" id="power-modal-title" style="font-size:17px;margin-top:0">Confirm Action</div>
+    <div class="subtitle" id="power-modal-msg" style="margin:8px 0 18px;font-size:13px;line-height:1.5">Are you sure?</div>
+    <div class="grid-2">
+      <button onclick="closePowerModal()">Cancel</button>
+      <button id="power-modal-confirm" class="btn-danger" onclick="execPowerConfirm()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="shot-modal" class="overlay-modal" onclick="closeShotModal()">
+  <div class="shot-modal-inner" onclick="stopModalBubble(event)">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <span class="os-badge"><span class="dot"></span> Fullscreen Live Desktop</span>
+      <div style="display:flex;gap:8px">
+        <button class="btn-sm" onclick="refreshScreenshot(false)">Refresh Frame</button>
+        <button class="btn-sm btn-danger" onclick="closeShotModal()">Close</button>
+      </div>
+    </div>
+    <img id="shot-modal-img" alt="Fullscreen Desktop View">
+  </div>
+</div>
+
+<div class="app-shell">
+  <aside class="sidebar-rail">
+    <div>
+      <div class="sidebar-brand">
+        <div class="brand-logo">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        </div>
+        <div>
+          <div style="font-weight:800;font-size:14px;letter-spacing:-0.2px">Mobile-RC</div>
+          <div style="font-size:11px;color:var(--muted)" id="side-os-badge">Control Center</div>
+        </div>
+      </div>
+      <div class="sidebar-links">
+        <button class="nav-item active" data-tab="monitor" onclick="switchTab('monitor', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 3 5-6"/></svg>
+          <span>Monitor</span>
+        </button>
+        <button class="nav-item" data-tab="media" onclick="switchTab('media', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="17.5" r="2.5"/><circle cx="17.5" cy="15.5" r="2.5"/><path d="M8 17.5V6l12-2v11.5"/></svg>
+          <span>Media &amp; Display</span>
+        </button>
+        <button class="nav-item" data-tab="boot" onclick="switchTab('boot', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+          <span>Boot &amp; Power</span>
+        </button>
+        <button class="nav-item" data-tab="remote" onclick="switchTab('remote', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/></svg>
+          <span>Remote &amp; Shell</span>
+        </button>
+        <button class="nav-item" data-tab="logs" onclick="switchTab('logs', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="14" y2="13"/><line x1="7" y1="17" x2="11" y2="17"/></svg>
+          <span>System &amp; Procs</span>
+        </button>
+        <button class="nav-item" data-tab="network" onclick="switchTab('network', this)">
+          <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="3.6" y1="9" x2="20.4" y2="9"/><line x1="3.6" y1="15" x2="20.4" y2="15"/><path d="M12 3a14.5 14.5 0 0 0 0 18 14.5 14.5 0 0 0 0-18"/></svg>
+          <span>Network &amp; Files</span>
+        </button>
+      </div>
+    </div>
+    <div class="sidebar-footer">
+      <button class="btn-danger" style="width:100%" onclick="doLogout()">
+        <svg class="svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        <span>Lock Session</span>
+      </button>
+    </div>
+  </aside>
+
+  <div class="main-wrap">
+    <div class="container">
+      <div class="header">
+        <div>
+          <div class="os-badge" id="os-badge"><span class="dot"></span> <span id="os-name">Loading...</span></div>
+          <div class="title" id="hostname">Mobile-RC</div>
+          <div class="subtitle num" id="kernel-uptime">Kernel - | Uptime -</div>
+        </div>
+        <div style="text-align:right">
+          <div class="num" style="font-size:20px;font-weight:800" id="bat-top">--</div>
+          <div class="subtitle" id="bat-status">Power</div>
+          <button id="logout-btn" onclick="doLogout()" class="btn-sm" style="margin-top:6px">Lock</button>
+        </div>
+      </div>
+
+      <!-- TAB 1: MONITOR -->
+      <div id="tab-monitor" class="tab-pane active">
+        <div class="bento-metrics">
+          <div class="stat-box">
+            <div class="stat-label">CPU LOAD</div>
+            <div class="stat-row"><span class="stat-val num" id="cpu-val">0%</span><span class="badge-pill num" id="cpu-peak">Peak 0%</span></div>
+            <div class="bar-bg"><div class="bar-fill" id="cpu-bar" style="width:0%"></div></div>
+            <div class="spark-wrap" id="cpu-spark"></div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">TEMPERATURE</div>
+            <div class="stat-row"><span class="stat-val num" id="temp-val">0°C</span><span class="badge-pill" id="temp-sub">Thermal</span></div>
+            <div class="bar-bg"><div class="bar-fill" id="temp-bar" style="width:0%"></div></div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">MEMORY (RAM)</div>
+            <div class="stat-row"><span class="stat-val num" id="ram-val">0 GB</span><span class="badge-pill num" id="ram-pct">0%</span></div>
+            <div class="bar-bg"><div class="bar-fill" id="ram-bar" style="width:0%"></div></div>
+          </div>
+          <div class="stat-box" id="stat-power-card">
+            <div class="stat-label" id="bat-label">POWER / GPU</div>
+            <div class="stat-row"><span class="stat-val num" id="bat-val">--</span></div>
+            <div class="subtitle num" style="font-size:11px;margin-bottom:5px" id="bat-sub">Swap: -- | Net: --</div>
+            <div class="bar-bg"><div class="bar-fill" id="bat-bar" style="width:0%"></div></div>
+            <div class="spark-wrap" id="net-spark"></div>
+          </div>
+        </div>
+
+        <div class="bento-2col">
+          <div class="card">
+            <div class="card-title">
+              <span class="card-title-left">
+                <svg class="svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                <span>Live Desktop Screen</span>
+              </span>
+              <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <select id="live-interval" class="compact-sel" onchange="changeLiveInterval(this.value)">
+                  <option value="0">Off</option>
+                  <option value="1000">1s</option>
+                  <option value="2000" selected>2s</option>
+                  <option value="5000">5s</option>
+                </select>
+                <button id="live-btn" class="btn-sm" onclick="toggleLiveMonitor()">Live ON</button>
+                <button class="btn-sm" onclick="refreshScreenshot(false)">Refresh</button>
+                <button class="btn-sm" onclick="openShotModal()">Expand</button>
+              </div>
+            </div>
+            <div class="shot-wrap" onclick="openShotModal()">
+              <span class="shot-placeholder" id="shot-placeholder">Loading live desktop screen...</span>
+              <img id="live-shot" style="display:none" alt="Live Desktop View">
+            </div>
+            <div class="grid-3" style="margin-top:10px">
+              <button class="btn-sm" onclick="doAction('hypr', 'fullscreen')">Fullscreen</button>
+              <button class="btn-sm" onclick="doAction('hypr', 'dpms_toggle')">Display Sleep</button>
+              <button class="btn-sm btn-danger" onclick="doAction('hypr', 'killactive')">Close Active</button>
+            </div>
+          </div>
+
+          <div>
+            <div class="card">
+              <div class="card-title">
+                <span class="card-title-left">
+                  <svg class="svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
+                  <span>Workspaces</span>
+                </span>
+              </div>
+              <div class="grid-4" id="ws-list"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-title">
+                <span class="card-title-left">
+                  <svg class="svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"/></svg>
+                  <span>Disk Partitions</span>
+                </span>
+                <button class="btn-sm" onclick="refreshFullStatus(true)">Refresh</button>
+              </div>
+              <div id="disk-list"><div class="subtitle">Scanning storage...</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 2: MEDIA & DISPLAY -->
+      <div id="tab-media" class="tab-pane">
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title"><span>Media Playback</span><span class="badge-pill" id="media-st">Stopped</span></div>
+            <div style="padding:12px;background:var(--card-inner);border-radius:12px;margin-bottom:12px;border:1px solid var(--border)">
+              <div style="font-size:15px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" id="media-title">No media active</div>
+            </div>
+            <div class="grid-3">
+              <button onclick="doMedia('prev')">Prev</button>
+              <button class="btn-primary" onclick="doMedia('play-pause')">Play / Pause</button>
+              <button onclick="doMedia('next')">Next</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title"><span>Audio Volume</span><span id="vol-label" class="num" style="color:var(--accent);font-weight:800">50%</span></div>
+            <input type="range" id="vol-slider" min="0" max="150" value="50" onchange="doMedia('vol_set', this.value)" oninput="previewSlider('vol-label', this.value)">
+            <div class="grid-3">
+              <button onclick="doMedia('vol_down')">-5%</button>
+              <button onclick="doMedia('mute')">Mute Toggle</button>
+              <button onclick="doMedia('vol_up')">+5%</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span>Screen Brightness</span><span id="bright-label" class="num" style="color:var(--accent);font-weight:800">50%</span></div>
+          <input type="range" id="bright-slider" min="5" max="100" value="50" onchange="doMedia('bright_set', this.value)" oninput="previewSlider('bright-label', this.value)">
+          <div class="grid-2">
+            <button onclick="doMedia('bright_down')">Dim (-10%)</button>
+            <button onclick="doMedia('bright_up')">Brighten (+10%)</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 3: BOOT, OS & POWER -->
+      <div id="tab-boot" class="tab-pane">
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title">
+              <span>Installed Operating Systems</span>
+              <div style="display:flex;gap:6px">
+                <button class="btn-sm" onclick="loadDistros(false, true)">Refresh</button>
+                <button class="btn-sm" id="btn-deep-scan" onclick="loadDistros(true, true)" style="border-color:rgba(56,189,248,0.45)">Deep Probe</button>
+              </div>
+            </div>
+            <div class="subtitle" id="distro-host-summary" style="margin-bottom:10px">Inspecting host OS environment...</div>
+            <div id="distro-list" style="display:flex;flex-direction:column;gap:6px">Loading OS inventory...</div>
+          </div>
+
+          <div>
+            <div class="card">
+              <div class="card-title"><span>UEFI Boot Switcher (Next Boot)</span></div>
+              <div style="display:flex;flex-direction:column;gap:8px" id="boot-list">
+                <div class="subtitle">Loading UEFI firmware entries...</div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-title"><span>Power &amp; Session Controls</span></div>
+              <div class="grid-2">
+                <button onclick="doPower('lock')">Lock Screen</button>
+                <button onclick="doPower('suspend')">Sleep / Suspend</button>
+                <button class="btn-primary" onclick="confirmBoot('reboot', 'Reboot Host System')">Reboot PC</button>
+                <button class="btn-danger" onclick="confirmBoot('poweroff', 'Power Off Host System')">Shutdown PC</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 4: REMOTE CONTROL & SHELL -->
+      <div id="tab-remote" class="tab-pane">
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title"><span>Remote Touchpad &amp; Keys</span><span class="badge-pill" id="tp-status">Ready</span></div>
+            <div id="touchpad-surface" class="touchpad-box">
+              <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 3l14 9-6.5 1.5L10 20 5 3z"/></svg>
+              <span>Drag to move cursor | Tap to left-click</span>
+            </div>
+            <div class="grid-3" style="margin-bottom:8px">
+              <button class="btn-sm" onclick="sendRemoteClick('left')">Left Click</button>
+              <button class="btn-sm" onclick="sendRemoteClick('middle')">Middle</button>
+              <button class="btn-sm" onclick="sendRemoteClick('right')">Right Click</button>
+            </div>
+            <div class="grid-2" style="margin-bottom:8px">
+              <button class="btn-sm" onclick="sendRemoteScroll(-3)">Scroll Up</button>
+              <button class="btn-sm" onclick="sendRemoteScroll(3)">Scroll Down</button>
+            </div>
+            <div class="grid-4">
+              <button class="btn-sm" onclick="sendRemoteKey('Escape')">Esc</button>
+              <button class="btn-sm" onclick="sendRemoteKey('Up')">Up</button>
+              <button class="btn-sm" onclick="sendRemoteKey('BackSpace')">Back</button>
+              <button class="btn-sm" onclick="sendRemoteKey('Return')">Enter</button>
+              <button class="btn-sm" onclick="sendRemoteKey('Left')">Left</button>
+              <button class="btn-sm" onclick="sendRemoteKey('Down')">Down</button>
+              <button class="btn-sm" onclick="sendRemoteKey('Right')">Right</button>
+              <button class="btn-sm" onclick="sendRemoteKey('space')">Space</button>
+            </div>
+          </div>
+
+          <div>
+            <div class="card">
+              <div class="card-title"><span>Clipboard, Notification &amp; URL</span></div>
+              <input type="text" id="msg-input" placeholder="Message, text snippet, or https:// URL..." style="margin-bottom:9px">
+              <div class="grid-3">
+                <button class="btn-primary" onclick="sendInput('notify')">Notify</button>
+                <button onclick="sendInput('clipboard')">Copy to PC</button>
+                <button onclick="sendInput('open_url')">Open URL</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-title"><span>Quick Application Launcher</span></div>
+              <div class="grid-2">
+                <button onclick="doAction('launch', 'terminal')">Open Terminal</button>
+                <button onclick="doAction('launch', 'youtube')">Open YouTube</button>
+                <button onclick="doAction('launch', 'files')">File Manager</button>
+                <button onclick="doAction('launch', 'btop')">System Monitor</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span>Quick Web Terminal</span></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <input type="text" id="cmd-input" style="flex:1;min-width:190px" placeholder="Command (e.g. df -h, uname -a, ip addr)..." onkeydown="handleCmdKey(event)">
+            <button class="btn-primary" onclick="runTerminal('shell')">Run Silent</button>
+            <button onclick="runTerminal('shell_gui')" style="border-color:rgba(56,189,248,0.45)">Open on Screen</button>
+            <button onclick="runTerminal('shell_type')">Type to Active</button>
+          </div>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer">
+            <input type="checkbox" id="cmd-auto-enter" checked style="width:auto">
+            <span>Auto-Enter when typing into active desktop window</span>
+          </label>
+          <pre class="term" id="term-out">Ready to execute commands or type prompts to host...</pre>
+        </div>
+      </div>
+
+      <!-- TAB 5: SYSTEM LOGS, PROCESSES & SERVICES -->
+      <div id="tab-logs" class="tab-pane">
+        <div class="card">
+          <div class="card-title">
+            <span>System Logs &amp; Audit Events</span>
+            <div style="display:flex;gap:6px;align-items:center">
+              <span class="badge-pill" id="logs-init-badge">init: --</span>
+              <button class="btn-sm" onclick="loadLogs()">Refresh</button>
+            </div>
+          </div>
+          <div class="grid-2" style="margin-bottom:8px">
+            <select id="log-source" onchange="loadLogs()">
+              <option value="all">All Sources</option>
+              <option value="mobile-rc">Mobile-RC Audit</option>
+            </select>
+            <select id="log-level" onchange="loadLogs()">
+              <option value="all">All Severities</option>
+              <option value="err">Errors Only</option>
+              <option value="warn">Warnings &amp; Errors</option>
+            </select>
+          </div>
+          <div style="display:flex;gap:8px;margin-bottom:10px">
+            <input type="text" id="log-query" placeholder="Filter log message..." onkeydown="handleLogQueryKey(event)">
+            <button onclick="loadLogs()">Filter</button>
+          </div>
+          <div id="logs-list" class="scroll-box" style="padding:0">
+            <div class="subtitle" style="padding:12px">Loading host logs...</div>
+          </div>
+        </div>
+
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title">
+              <span>Top Processes</span>
+              <button class="btn-sm" onclick="loadProcesses()">Refresh</button>
+            </div>
+            <div id="proc-list" class="scroll-box">
+              <div class="subtitle" style="padding:10px">Open tab or click Refresh to inspect processes...</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              <span>Host Services</span>
+              <button class="btn-sm" onclick="loadServices()">Refresh</button>
+            </div>
+            <input type="text" id="svc-filter" placeholder="Search service name..." style="margin-bottom:8px" oninput="filterServices()">
+            <div id="svc-list" class="scroll-box">
+              <div class="subtitle" style="padding:10px">Open tab or click Refresh to inspect services...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 6: NETWORK, DEVICES, FILES & FEEDBACK -->
+      <div id="tab-network" class="tab-pane">
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title">
+              <span>LAN Addresses &amp; Wake-on-LAN MACs</span>
+              <button class="btn-sm" onclick="refreshFullStatus(true)">Refresh</button>
+            </div>
+            <div id="lan-info-box"><div class="subtitle">Loading interface addresses...</div></div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              <span>Paired Mobile Devices</span>
+              <button class="btn-sm" onclick="loadDevices()">Refresh</button>
+            </div>
+            <div id="devices-list"><div class="subtitle">Loading paired devices...</div></div>
+          </div>
+        </div>
+
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title"><span>Remote HTTPS Tunnel (Opt-In)</span></div>
+            <p class="subtitle" style="margin-bottom:10px">Disabled by default. Enable only when connecting outside your LAN; RAC / PIN login remains mandatory.</p>
+            <div id="tunnel-box" style="background:var(--card-inner);padding:11px;border-radius:11px;border:1px solid var(--border);margin-bottom:10px;word-break:break-all;font-size:12px">
+              Status: <b id="tunnel-status">Checking...</b>
+              <div id="tunnel-url-wrap" style="margin-top:6px;display:none">
+                Public URL: <a id="tunnel-link" href="#" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-weight:700"></a>
+              </div>
+            </div>
+            <div class="grid-2">
+              <button class="btn-success" onclick="toggleTunnel('start')">Start Tunnel</button>
+              <button class="btn-danger" onclick="toggleTunnel('stop')">Stop Tunnel</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title"><span>Upload File to Host Downloads</span></div>
+            <input type="file" id="file-upload" style="margin-bottom:10px;font-size:12px">
+            <button class="btn-primary" style="width:100%" onclick="uploadFile()">Upload to PC Now</button>
+          </div>
+        </div>
+
+        <div class="bento-pair">
+          <div class="card">
+            <div class="card-title">
+              <span>Download Files from Host</span>
+              <button class="btn-sm" onclick="loadFiles()">Refresh</button>
+            </div>
+            <div id="file-list" class="scroll-box" style="max-height:280px"><div class="subtitle" style="padding:10px">Loading files...</div></div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              <span>Feedback &amp; Bug Reports</span>
+              <span class="badge-pill">brypra4@gmail.com</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <select id="fb-category">
+                <option value="suggestion">Suggestion / Feature Idea</option>
+                <option value="bug">Bug Report</option>
+                <option value="other">Other Question / Feedback</option>
+              </select>
+              <input type="text" id="fb-subject" maxlength="120" placeholder="Short summary / subject">
+              <input type="email" id="fb-reply" maxlength="120" placeholder="Your email (optional, for reply)">
+              <textarea id="fb-message" rows="3" maxlength="4000" placeholder="Describe your suggestion, issue, or reproduction steps..."></textarea>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer">
+                <input type="checkbox" id="fb-sysinfo" checked style="width:auto">
+                <span>Attach host OS / init / compositor info (no IPs or tokens)</span>
+              </label>
+              <button class="btn-primary" onclick="submitFeedback()" id="fb-submit-btn">Send Feedback</button>
+            </div>
+            <div id="fb-status" style="font-size:12px;margin-top:8px;color:var(--muted)"></div>
+            <div id="fb-fallbacks" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<nav class="bottom-nav">
+  <button class="nav-item active" data-tab="monitor" onclick="switchTab('monitor', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 3 5-6"/></svg>
+    <span>Monitor</span>
+  </button>
+  <button class="nav-item" data-tab="media" onclick="switchTab('media', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="5.5" cy="17.5" r="2.5"/><circle cx="17.5" cy="15.5" r="2.5"/><path d="M8 17.5V6l12-2v11.5"/></svg>
+    <span>Media</span>
+  </button>
+  <button class="nav-item" data-tab="boot" onclick="switchTab('boot', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+    <span>Boot</span>
+  </button>
+  <button class="nav-item" data-tab="remote" onclick="switchTab('remote', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M8 14h8"/></svg>
+    <span>Remote</span>
+  </button>
+  <button class="nav-item" data-tab="logs" onclick="switchTab('logs', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="14" x2="13" y2="14"/></svg>
+    <span>System</span>
+  </button>
+  <button class="nav-item" data-tab="network" onclick="switchTab('network', this)">
+    <svg class="svg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><line x1="3.6" y1="9" x2="20.4" y2="9"/><line x1="3.6" y1="15" x2="20.4" y2="15"/></svg>
+    <span>Network</span>
+  </button>
+</nav>
+
+<script>
+let _activeTab = 'monitor';
+let _liveEnabled = true;
+let _liveIntervalMs = 2000;
+let _liveTimer = null;
+let _shotInFlight = false;
+let _liveShotUrl = null;
+let _cachedBootEntries = null;
+let _authenticated = false;
+let _csrfToken = '';
+let _pollTimer = null;
+let _lastWsSig = '';
+let _lastDiskSig = '';
+let _cpuHist = [];
+let _netHist = [];
+let _servicesCache = [];
+let _pendingModal = null;
+let _pinMode = 'on_demand';
+let _loginBusy = false;
+
+function handleEmailKey(e) { if (e && e.key === 'Enter') requestEmailCode(); }
+function handlePinKey(e) { if (e && e.key === 'Enter') submitLogin(); }
+function handleCmdKey(e) { if (e && e.key === 'Enter') runTerminal('shell'); }
+function handleLogQueryKey(e) { if (e && e.key === 'Enter') loadLogs(); }
+function stopModalBubble(e) { if (e) e.stopPropagation(); }
+
+function previewSlider(labelId, val) {
+  const el = document.getElementById(labelId);
+  if (el) el.textContent = String(val) + '%';
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+function showLogin(msg = '') {
+  _authenticated = false;
+  if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
+  const pinEl = document.getElementById('pin-input');
+  if (pinEl) pinEl.value = '';
+  const emailSt = document.getElementById('email-otp-status');
+  if (emailSt) emailSt.textContent = '';
+  document.getElementById('login-err').textContent = msg;
+  document.getElementById('login-overlay').style.display = 'flex';
+  const emailBox = document.getElementById('email-otp-box');
+  const emailEl = document.getElementById('email-input');
+  if (emailBox && emailBox.style.display !== 'none' && emailEl && !emailEl.value.trim()) {
+    emailEl.focus();
+  } else if (pinEl) {
+    pinEl.focus();
+  }
+}
+
+function scheduleTelemetryPoll(delayMs = 3500) {
+  if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+  if (_authenticated && !document.hidden) {
+    _pollTimer = setTimeout(async () => {
+      await refreshTelemetry();
+      scheduleTelemetryPoll(3500);
+    }, delayMs);
+  }
+}
+
+function hideLogin() {
+  _authenticated = true;
+  _lastWsSig = '';
+  _lastDiskSig = '';
+  document.getElementById('login-err').textContent = '';
+  document.getElementById('pin-input').value = '';
+  document.getElementById('login-overlay').style.display = 'none';
+  updateLiveButton();
+  refreshFullStatus(false);
+  scheduleTelemetryPoll(3500);
+  refreshScreenshot(true);
+}
+
+function onPinInput(el) {
+  if (!el) return;
+  if (_pinMode !== 'static') {
+    const digits = el.value.replace(/\D+/g, '').slice(0, 6);
+    if (el.value !== digits) el.value = digits;
+    if (digits.length === 6 && !_loginBusy) submitLogin();
+  }
+}
+
+async function initAuth() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const handoff = (urlParams.get('handoff') || hashParams.get('handoff') || '').trim();
+  const autoRac = (urlParams.get('rac') || hashParams.get('rac') || '').trim();
+  if (handoff || autoRac) window.history.replaceState(null, '', window.location.pathname);
+  try {
+    const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
+    const d = await r.json();
+    if (d && d.pin_mode) _pinMode = d.pin_mode;
+    const hint = document.getElementById('login-hint');
+    const badge = document.getElementById('login-badge-text');
+    const emailBox = document.getElementById('email-otp-box');
+    const emailStatus = document.getElementById('email-otp-status');
+    if (d && d.is_non_local) {
+      if (badge) badge.textContent = 'Mobile-RC • Online Access';
+      if (d.email_otp_enabled) {
+        if (emailBox) emailBox.style.display = 'block';
+        if (hint) hint.textContent = 'External network detected. Request a 6-digit RAC via your registered email (auto-unlocks on 6th digit).';
+      } else {
+        if (emailBox) emailBox.style.display = 'none';
+        if (hint) hint.textContent = 'External network detected. Configure Email OTP on host via: control-access --setup-email';
+      }
+    } else {
+      if (badge) badge.textContent = 'Mobile-RC • Local LAN';
+      if (emailBox) emailBox.style.display = 'none';
+      if (hint) {
+        hint.textContent = (d && d.pin_mode === 'static')
+          ? 'Enter the static PIN configured in pin.txt on your host.'
+          : 'Local LAN: run control-access on your host and enter the 6-digit RAC below.';
+      }
+    }
+    if (emailStatus) emailStatus.textContent = '';
+    if (d && d.authenticated && d.csrf_token) {
+      _csrfToken = d.csrf_token;
+      hideLogin();
+      return;
+    }
+    if (handoff) {
+      const hr = await fetch('/api/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ handoff_token: handoff }),
+      });
+      const hd = await hr.json();
+      if (hr.ok && hd.ok && hd.csrf_token) {
+        _csrfToken = hd.csrf_token;
+        hideLogin();
+        toast('Unlocked!');
+        return;
+      }
+    }
+    if (autoRac && /^\d{6}$/.test(autoRac)) {
+      const pinEl = document.getElementById('pin-input');
+      if (pinEl) {
+        pinEl.value = autoRac;
+        await submitLogin();
+        if (_authenticated) return;
+      }
+    }
+  } catch (e) {}
+  showLogin('');
+}
+
+async function requestEmailCode() {
+  const emailEl = document.getElementById('email-input');
+  const statusEl = document.getElementById('email-otp-status');
+  const btn = document.getElementById('send-email-btn');
+  const email = (emailEl ? emailEl.value : '').trim();
+  if (!email || !email.includes('@')) {
+    if (statusEl) { statusEl.style.color = '#fca5a5'; statusEl.textContent = 'Please enter a valid email address.'; }
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (statusEl) { statusEl.style.color = 'var(--muted)'; statusEl.textContent = 'Sending verification code...'; }
+  try {
+    const r = await fetch('/api/pairing/email-code', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      if (statusEl) { statusEl.style.color = 'var(--success)'; statusEl.textContent = d.message || 'Check your inbox for the 6-digit code.'; }
+      const pinInp = document.getElementById('pin-input');
+      if (pinInp) pinInp.focus();
+    } else if (statusEl) {
+      statusEl.style.color = '#fca5a5';
+      statusEl.textContent = d.message || 'Could not send email code.';
+    }
+  } catch (e) {
+    if (statusEl) { statusEl.style.color = '#fca5a5'; statusEl.textContent = 'Connection error while sending email code.'; }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function submitLogin() {
+  if (_loginBusy) return;
+  const pin = document.getElementById('pin-input').value.trim();
+  const errEl = document.getElementById('login-err');
+  if (!pin) { errEl.textContent = 'Please enter your access code.'; return; }
+  _loginBusy = true;
+  errEl.textContent = 'Verifying...';
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin }),
+    });
+    const d = await r.json();
+    if (r.ok && d.ok && d.csrf_token) {
+      _csrfToken = d.csrf_token;
+      hideLogin();
+      toast('Unlocked!');
+    } else {
+      errEl.textContent = d.message || 'Authentication failed';
+    }
+  } catch (e) {
+    errEl.textContent = 'Connection error';
+  } finally {
+    _loginBusy = false;
+  }
+}
+
+async function doLogout() {
+  try { await api('/api/logout', 'POST', {}); } catch (e) {}
+  _cachedBootEntries = null;
+  showLogin('Locked');
+}
+
+function switchTab(name, btn) {
+  _activeTab = name;
+  document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.tab === name);
+  });
+  const pane = document.getElementById('tab-' + name);
+  if (pane) pane.classList.add('active');
+  if (name === 'monitor') {
+    if (_liveEnabled && _liveIntervalMs > 0 && _authenticated) refreshScreenshot(true);
+  } else if (_liveTimer) {
+    clearTimeout(_liveTimer);
+    _liveTimer = null;
+  }
+  if (name === 'boot') loadDistros(false, false);
+  if (name === 'logs') { loadLogs(); loadProcesses(); loadServices(); }
+  if (name === 'network') { loadFiles(); loadDevices(); }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+    if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
+  } else if (_authenticated) {
+    refreshTelemetry();
+    scheduleTelemetryPoll(3500);
+    if (_activeTab === 'monitor' && _liveEnabled && _liveIntervalMs > 0) refreshScreenshot(true);
+  }
+});
+
+async function api(path, method = 'GET', body = null) {
+  const opts = { method, credentials: 'same-origin', headers: {} };
+  if (method !== 'GET' && _csrfToken) opts.headers['X-CSRF-Token'] = _csrfToken;
+  if (body !== null) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opts);
+  if (r.status === 401) {
+    showLogin('Session expired. Enter access code again.');
+    throw new Error('Unauthorized');
+  }
+  return await r.json();
+}
+
+function renderSparkline(containerId, values, maxFloor, colorHex) {
+  const wrap = document.getElementById(containerId);
+  if (!wrap || !values.length) return;
+  const maxVal = Math.max(maxFloor, ...values);
+  const w = 120;
+  const h = 28;
+  const n = values.length;
+  const pts = values.map((v, idx) => {
+    const x = n === 1 ? w : Math.round((idx / (n - 1)) * w * 10) / 10;
+    const y = Math.round((h - 2 - (Math.max(0, v) / maxVal) * (h - 5)) * 10) / 10;
+    return x + ',' + y;
+  });
+  wrap.textContent = '';
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 120 28');
+  svg.setAttribute('preserveAspectRatio', 'none');
+  const polyArea = document.createElementNS(ns, 'polygon');
+  polyArea.setAttribute('fill', colorHex);
+  polyArea.setAttribute('fill-opacity', '0.16');
+  polyArea.setAttribute('points', '0,28 ' + pts.join(' ') + ' ' + w + ',28');
+  const polyLine = document.createElementNS(ns, 'polyline');
+  polyLine.setAttribute('fill', 'none');
+  polyLine.setAttribute('stroke', colorHex);
+  polyLine.setAttribute('stroke-width', '1.8');
+  polyLine.setAttribute('stroke-linejoin', 'round');
+  polyLine.setAttribute('points', pts.join(' '));
+  svg.appendChild(polyArea);
+  svg.appendChild(polyLine);
+  wrap.appendChild(svg);
+}
+
+function applyTelemetryData(d) {
+  if (!d || !d.os) return;
+  document.getElementById('os-name').textContent = d.os.name;
+  document.getElementById('side-os-badge').textContent = d.os.name + ' (' + (d.init_system || 'host') + ')';
+  document.getElementById('hostname').textContent = d.os.hostname;
+  document.getElementById('kernel-uptime').textContent = d.os.kernel + ' | Up ' + d.os.uptime;
+
+  const cpuPct = Number(d.cpu_pct || 0);
+  _cpuHist.push(cpuPct);
+  if (_cpuHist.length > 30) _cpuHist.shift();
+  const peakCpu = Math.round(Math.max(..._cpuHist));
+  document.getElementById('cpu-val').textContent = cpuPct + '%';
+  document.getElementById('cpu-peak').textContent = 'Peak ' + peakCpu + '%';
+  document.getElementById('cpu-bar').style.width = Math.min(100, cpuPct) + '%';
+  renderSparkline('cpu-spark', _cpuHist, 100, '#38bdf8');
+
+  document.getElementById('temp-val').textContent = d.cpu_temp + '°C';
+  document.getElementById('temp-bar').style.width = Math.min(100, Number(d.cpu_temp || 0)) + '%';
+
+  document.getElementById('ram-val').textContent = d.ram.used_gb + '/' + d.ram.total_gb + ' GB';
+  document.getElementById('ram-pct').textContent = d.ram.percent + '%';
+  document.getElementById('ram-bar').style.width = d.ram.percent + '%';
+
+  const bat = d.battery || {};
+  const gpu = d.gpu || {};
+  const swap = d.swap || {};
+  const net = d.network || {};
+  const batLabelEl = document.getElementById('bat-label');
+  const batSubEl = document.getElementById('bat-sub');
+  const batBarEl = document.getElementById('bat-bar');
+  if (bat.percent !== null && bat.percent !== undefined) {
+    batLabelEl.textContent = bat.has_ups ? 'UPS BACKUP' : 'BATTERY LEVEL';
+    document.getElementById('bat-val').textContent = bat.percent + '%';
+    batBarEl.style.width = bat.percent + '%';
+    document.getElementById('bat-top').textContent = (bat.plugged ? 'AC ' : '') + bat.percent + '%';
+    document.getElementById('bat-status').textContent = bat.status || 'Battery';
+  } else {
+    batLabelEl.textContent = gpu.available ? 'DESKTOP / GPU' : 'HOST POWER';
+    let gpuVal = 'AC';
+    let barPct = 100;
+    if (gpu.busy_pct !== null && gpu.busy_pct !== undefined) {
+      gpuVal = gpu.busy_pct + '%';
+      barPct = Math.max(0, Math.min(100, gpu.busy_pct));
+    } else if (gpu.temp_c !== null && gpu.temp_c !== undefined) {
+      gpuVal = gpu.temp_c + '°C';
+      barPct = Math.min(100, Math.round(gpu.temp_c));
+    }
+    document.getElementById('bat-val').textContent = gpuVal;
+    batBarEl.style.width = barPct + '%';
+    document.getElementById('bat-top').textContent = 'AC';
+    document.getElementById('bat-status').textContent = (gpu.temp_c !== null && gpu.temp_c !== undefined) ? (gpu.temp_c + '°C GPU') : (bat.status || 'AC Host');
+  }
+  const rx = Number(net.rx_kbps || 0);
+  const tx = Number(net.tx_kbps || 0);
+  _netHist.push(Math.round((rx + tx) * 10) / 10);
+  if (_netHist.length > 30) _netHist.shift();
+  const swapTxt = (swap.total_gb > 0) ? ('Swap ' + swap.used_gb + '/' + swap.total_gb + 'GB') : 'Swap off';
+  if (batSubEl) batSubEl.textContent = swapTxt + ' | RX ' + rx + ' / TX ' + tx + ' KiB/s';
+  renderSparkline('net-spark', _netHist, 64, '#10b981');
+
+  if (d.media) {
+    document.getElementById('vol-label').textContent = (d.media.muted ? 'MUTED ' : '') + d.media.volume + '%';
+    document.getElementById('vol-slider').value = d.media.volume;
+    document.getElementById('bright-label').textContent = d.media.brightness + '%';
+    document.getElementById('bright-slider').value = d.media.brightness;
+    document.getElementById('media-st').textContent = d.media.media_status;
+    document.getElementById('media-title').textContent = d.media.media_title;
+  }
+
+  const wsEl = document.getElementById('ws-list');
+  if (wsEl) {
+    const wsList = Array.isArray(d.workspaces) && d.workspaces.length
+      ? d.workspaces
+      : [{ id: 1, name: '1', active: true }, { id: 2, name: '2', active: false }, { id: 3, name: '3', active: false }, { id: 4, name: '4', active: false }];
+    const wsSig = wsList.map(w => w.id + ':' + (w.name || w.id) + ':' + (w.active ? 1 : 0)).join('|');
+    if (wsSig !== _lastWsSig) {
+      _lastWsSig = wsSig;
+      wsEl.style.gridTemplateColumns = 'repeat(' + (wsList.length <= 4 ? wsList.length : 4) + ', 1fr)';
+      wsEl.textContent = '';
+      for (const w of wsList) {
+        const b = document.createElement('button');
+        b.className = w.active ? 'btn-sm btn-primary' : 'btn-sm';
+        b.textContent = (w.name && String(w.name) !== String(w.id)) ? ('WS ' + w.id + ' (' + w.name + ')') : ('WS ' + w.id);
+        b.addEventListener('click', () => doAction('ws', String(w.id)));
+        wsEl.appendChild(b);
+      }
+    }
+  }
+
+  const dl = document.getElementById('disk-list');
+  if (dl && Array.isArray(d.disks)) {
+    const diskSig = d.disks.map(x => x.part + ':' + x.use_pct + ':' + x.size + ':' + (x.mounted ? 1 : 0)).join('|');
+    if (diskSig !== _lastDiskSig) {
+      _lastDiskSig = diskSig;
+      dl.textContent = '';
+      if (d.disks.length) {
+        for (const x of d.disks) {
+          const row = document.createElement('div');
+          row.className = 'row-item';
+          const col = document.createElement('div');
+          col.className = 'row-item-col';
+          const title = document.createElement('div');
+          title.className = 'row-title';
+          title.textContent = x.label + ' (' + x.part + ')';
+          const sub = document.createElement('div');
+          sub.className = 'row-sub';
+          sub.textContent = (x.fstype || 'disk') + ' | ' + x.size + (x.mountpoint ? (' | ' + x.mountpoint) : '');
+          col.appendChild(title);
+          col.appendChild(sub);
+          const pill = document.createElement('span');
+          pill.className = 'badge-pill num ' + (x.mounted ? 'pill-ok' : '');
+          pill.textContent = x.use_pct || '--';
+          row.appendChild(col);
+          row.appendChild(pill);
+          dl.appendChild(row);
+        }
+      } else {
+        const empty = document.createElement('div');
+        empty.className = 'subtitle';
+        empty.textContent = 'No storage partitions detected.';
+        dl.appendChild(empty);
+      }
+    }
+  }
+
+  if (d.boot_entries && (!_cachedBootEntries || d.boot_entries.length)) {
+    const sameBoot = _cachedBootEntries && JSON.stringify(_cachedBootEntries) === JSON.stringify(d.boot_entries);
+    if (!sameBoot) {
+      _cachedBootEntries = d.boot_entries;
+      const bl = document.getElementById('boot-list');
+      bl.textContent = '';
+      for (const e of d.boot_entries) {
+        let btnClass = 'btn-os';
+        const n = String(e.name || '').toLowerCase();
+        if (n.includes('cachyos') || n.includes('cachy')) btnClass += ' btn-cachyos';
+        else if (n.includes('nixos')) btnClass += ' btn-nixos';
+        else if (n.includes('arch')) btnClass += ' btn-arch';
+        else if (n.includes('garuda')) btnClass += ' btn-garuda';
+        else if (n.includes('gentoo')) btnClass += ' btn-gentoo';
+        const btn = document.createElement('button');
+        btn.className = btnClass;
+        const left = document.createElement('span');
+        const b = document.createElement('b');
+        b.textContent = e.name;
+        left.appendChild(b);
+        left.appendChild(document.createTextNode(' (Boot' + e.num + ')'));
+        const badge = document.createElement('span');
+        badge.className = 'badge-pill';
+        badge.textContent = 'Reboot Next';
+        btn.appendChild(left);
+        btn.appendChild(badge);
+        btn.addEventListener('click', () => confirmBootNum(e.num, e.name));
+        bl.appendChild(btn);
+      }
+      const uefiBtn = document.createElement('button');
+      uefiBtn.className = 'btn-os';
+      const uLeft = document.createElement('b');
+      uLeft.textContent = 'Enter BIOS / UEFI Firmware Setup';
+      const uTag = document.createElement('span');
+      uTag.className = 'badge-pill';
+      uTag.textContent = 'Firmware';
+      uefiBtn.appendChild(uLeft);
+      uefiBtn.appendChild(uTag);
+      uefiBtn.addEventListener('click', () => confirmBoot('uefi', 'BIOS / UEFI Firmware Settings'));
+      bl.appendChild(uefiBtn);
+    }
+  }
+
+  const lanBox = document.getElementById('lan-info-box');
+  if (lanBox) {
+    lanBox.textContent = '';
+    const ips = Array.isArray(d.ips) ? d.ips : [];
+    const macs = Array.isArray(net.macs) ? net.macs : [];
+    if (!ips.length && !macs.length) {
+      const empty = document.createElement('div');
+      empty.className = 'subtitle';
+      empty.textContent = 'No active LAN interfaces reported.';
+      lanBox.appendChild(empty);
+    } else {
+      for (const ip of ips) _appendKvRow(lanBox, 'LAN IPv4', ip);
+      for (const m of macs) _appendKvRow(lanBox, 'WoL (' + (m.iface || 'NIC') + ')', m.mac || '-');
+    }
+  }
+
+  if (d.tunnel) {
+    document.getElementById('tunnel-status').textContent = String(d.tunnel.status || 'stopped').toUpperCase();
+    const tw = document.getElementById('tunnel-url-wrap');
+    if (d.tunnel.url) {
+      tw.style.display = 'block';
+      const tl = document.getElementById('tunnel-link');
+      tl.href = d.tunnel.url;
+      tl.textContent = d.tunnel.url;
+    } else {
+      tw.style.display = 'none';
+    }
+  }
+}
+
+async function refreshTelemetry() {
+  if (!_authenticated || document.hidden) return;
+  try {
+    const d = await api('/api/telemetry');
+    applyTelemetryData(d);
+  } catch (e) {}
+}
+
+async function refreshFullStatus(forceRefresh = false) {
+  if (!_authenticated) return;
+  try {
+    const d = await api('/api/status' + (forceRefresh ? '?refresh=1' : ''));
+    applyTelemetryData(d);
+    if (forceRefresh) toast('Telemetry refreshed');
+  } catch (e) {}
+}
+
+function updateLiveButton() {
+  const btn = document.getElementById('live-btn');
+  if (!btn) return;
+  if (_liveEnabled && _liveIntervalMs > 0) {
+    btn.textContent = 'Live ON';
+    btn.style.borderColor = 'rgba(16,185,129,0.5)';
+    btn.style.color = 'var(--success)';
+  } else {
+    btn.textContent = 'Paused';
+    btn.style.borderColor = 'var(--border)';
+    btn.style.color = 'var(--muted)';
+  }
+}
+
+function changeLiveInterval(msVal) {
+  const ms = Number(msVal);
+  _liveIntervalMs = Number.isFinite(ms) ? ms : 2000;
+  _liveEnabled = _liveIntervalMs > 0;
+  updateLiveButton();
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
+  if (_liveEnabled && _authenticated && _activeTab === 'monitor') refreshScreenshot(true);
+}
+
+function toggleLiveMonitor() {
+  if (_liveIntervalMs === 0) {
+    _liveIntervalMs = 2000;
+    const sel = document.getElementById('live-interval');
+    if (sel) sel.value = '2000';
+    _liveEnabled = true;
+  } else {
+    _liveEnabled = !_liveEnabled;
+  }
+  updateLiveButton();
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
+  if (_liveEnabled && _authenticated && _activeTab === 'monitor') refreshScreenshot(true);
+}
+
+function openShotModal() {
+  const modal = document.getElementById('shot-modal');
+  const mImg = document.getElementById('shot-modal-img');
+  if (_liveShotUrl && mImg) mImg.src = _liveShotUrl;
+  if (modal) modal.style.display = 'flex';
+  refreshScreenshot(false);
+}
+
+function closeShotModal() {
+  const modal = document.getElementById('shot-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+function scheduleLiveShot() {
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
+  if (_authenticated && _liveEnabled && _liveIntervalMs > 0 && _activeTab === 'monitor' && !document.hidden) {
+    _liveTimer = setTimeout(() => refreshScreenshot(true), _liveIntervalMs);
+  }
+}
+
+async function refreshScreenshot(fromAuto = false) {
+  if (!_authenticated || _shotInFlight) return;
+  _shotInFlight = true;
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; }
+  const img = document.getElementById('live-shot');
+  const mImg = document.getElementById('shot-modal-img');
+  const ph = document.getElementById('shot-placeholder');
+  try {
+    const r = await fetch('/api/screenshot?t=' + Date.now(), { credentials: 'same-origin' });
+    if (r.status === 401) { showLogin('Session expired. Enter access code again.'); return; }
+    if (!r.ok) {
+      if (!_liveShotUrl && ph) {
+        img.style.display = 'none';
+        ph.textContent = 'Desktop capture unavailable';
+        ph.style.display = 'block';
+      }
+      return;
+    }
+    const blob = await r.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const prevUrl = _liveShotUrl;
+    _liveShotUrl = objUrl;
+    img.src = objUrl;
+    img.style.display = 'block';
+    if (mImg) mImg.src = objUrl;
+    if (ph) ph.style.display = 'none';
+    if (prevUrl) setTimeout(() => URL.revokeObjectURL(prevUrl), 250);
+  } catch (e) {
+    if (!fromAuto && !_liveShotUrl && ph) {
+      img.style.display = 'none';
+      ph.style.display = 'block';
+    }
+  } finally {
+    _shotInFlight = false;
+    if (_liveEnabled && _liveIntervalMs > 0) scheduleLiveShot();
+  }
+}
+
+async function doMedia(action, value = '') {
+  const r = await api('/api/media', 'POST', { action, value: String(value) });
+  toast(r.message || 'Success');
+  refreshTelemetry();
+}
+
+async function doPower(target) {
+  const r = await api('/api/power', 'POST', { target });
+  toast(r.message || 'Command sent');
+}
+
+function openConfirmModal(title, msg, payload) {
+  _pendingModal = payload;
+  document.getElementById('power-modal-title').textContent = title;
+  document.getElementById('power-modal-msg').textContent = msg;
+  document.getElementById('power-modal').style.display = 'flex';
+}
+
+function closePowerModal() {
+  _pendingModal = null;
+  document.getElementById('power-modal').style.display = 'none';
+}
+
+async function execPowerConfirm() {
+  const p = _pendingModal;
+  closePowerModal();
+  if (!p) return;
+  if (p.kind === 'power') {
+    const r = await api('/api/power', 'POST', p.body);
+    toast(r.message || 'Command executed');
+  } else if (p.kind === 'kill') {
+    const r = await api('/api/process/kill', 'POST', { pid: p.pid, signal: 'TERM' });
+    toast(r.message || 'Signal sent');
+    loadProcesses();
+  }
+}
+
+function confirmBoot(target, label) {
+  openConfirmModal('Confirm Power Action', 'Execute: ' + label + '? Active sessions may terminate immediately.', { kind: 'power', body: { target } });
+}
+
+function confirmBootNum(num, name) {
+  openConfirmModal('Switch Boot Target', 'Reboot PC into ' + name + ' (UEFI Boot' + num + ')?', { kind: 'power', body: { target: 'bootnum', bootnum: num, name } });
+}
+
+function confirmKillProc(pid, name) {
+  openConfirmModal('Terminate Process', 'Send SIGTERM / terminate process ' + name + ' (PID ' + pid + ')?', { kind: 'kill', pid, name });
+}
+
+async function doAction(type, value) {
+  const r = await api('/api/action', 'POST', { type, value });
+  toast(r.message || 'Done');
+  if (r.ok !== false && (type === 'ws' || type === 'hypr')) {
+    refreshTelemetry();
+    setTimeout(() => refreshScreenshot(false), 350);
+  }
+}
+
+async function sendInput(type) {
+  const val = document.getElementById('msg-input').value.trim();
+  if (!val) return toast('Enter a message, snippet, or URL first');
+  const r = await api('/api/action', 'POST', { type, value: val });
+  toast(r.message || 'Sent');
+  document.getElementById('msg-input').value = '';
+}
+
+function _appendSectionHeader(parent, title) {
+  const h = document.createElement('div');
+  h.style.cssText = 'font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;margin-top:8px;margin-bottom:2px';
+  h.textContent = title;
+  parent.appendChild(h);
+}
+
+function _appendKvRow(parent, leftText, rightText) {
+  const row = document.createElement('div');
+  row.className = 'row-item';
+  const l = document.createElement('div');
+  l.className = 'row-title';
+  l.textContent = leftText;
+  const r = document.createElement('div');
+  r.className = 'row-sub num';
+  r.style.flexShrink = '0';
+  r.textContent = rightText;
+  row.appendChild(l);
+  row.appendChild(r);
+  parent.appendChild(row);
+}
+
+async function loadDistros(deep, refresh) {
+  const sumEl = document.getElementById('distro-host-summary');
+  const listEl = document.getElementById('distro-list');
+  const btn = document.getElementById('btn-deep-scan');
+  if (!sumEl || !listEl) return;
+  if (deep && btn) { btn.disabled = true; btn.textContent = 'Scanning...'; }
+  const qs = '?deep=' + (deep ? '1' : '0') + (refresh ? '&refresh=1' : '');
+  const d = await api('/api/distros' + qs);
+  if (deep && btn) { btn.disabled = false; btn.textContent = 'Deep Probe'; }
+  if (!d || (d.ok === false && d.status)) {
+    sumEl.textContent = 'Failed to scan host OS inventory.';
+    return;
+  }
+  const h = d.host || {};
+  sumEl.textContent = [h.name || 'Host', 'Init: ' + (h.init_system || 'unknown'), 'Comp: ' + (h.compositor || 'unknown'), 'Kernel: ' + (h.kernel || '-'), h.cpu_model || '', h.gpu_name || ''].filter(Boolean).join(' | ');
+  listEl.textContent = '';
+
+  _appendSectionHeader(listEl, 'Detected Operating Systems (' + (d.detected_distros || []).length + ')');
+  (d.detected_distros || []).forEach(item => {
+    _appendKvRow(listEl, item.name || 'OS', (item.source || '') + (item.detail ? (' - ' + item.detail) : ''));
+  });
+  if (d.unmounted_distros && d.unmounted_distros.length > 0) {
+    _appendSectionHeader(listEl, 'Unmounted Partition Probe');
+    d.unmounted_distros.forEach(u => _appendKvRow(listEl, u.name + ' (' + (u.subvolume || '/') + ')', u.device + ' [' + u.fstype + ']'));
+  } else if (d.deep_scan) {
+    _appendKvRow(listEl, 'Unmounted Partitions', 'No additional OS roots found');
+  }
+  if (d.bootloader_entries && d.bootloader_entries.length > 0) {
+    _appendSectionHeader(listEl, 'Bootloader Entries');
+    d.bootloader_entries.slice(0, 12).forEach(b => _appendKvRow(listEl, b.title || b.file, b.loader + (b.kernel ? (' | ' + b.kernel) : '')));
+  }
+  if (d.filesystems && d.filesystems.length > 0) {
+    _appendSectionHeader(listEl, 'Mounted Filesystems');
+    d.filesystems.slice(0, 10).forEach(fs => _appendKvRow(listEl, fs.target || '/', (fs.fstype || '') + ' (' + (fs.source || '') + ')'));
+  }
+}
+
+async function loadLogs() {
+  const listEl = document.getElementById('logs-list');
+  const badgeEl = document.getElementById('logs-init-badge');
+  const srcEl = document.getElementById('log-source');
+  if (!listEl || !srcEl) return;
+  const curSrc = srcEl.value || 'all';
+  const lvl = document.getElementById('log-level').value;
+  const q = document.getElementById('log-query').value.trim();
+  const qs = '?source=' + encodeURIComponent(curSrc) + '&level=' + encodeURIComponent(lvl) + '&q=' + encodeURIComponent(q) + '&lines=120';
+  const d = await api('/api/logs' + qs);
+  if (!d || (d.ok === false && d.status)) {
+    listEl.textContent = '';
+    const errDiv = document.createElement('div');
+    errDiv.style.padding = '12px';
+    errDiv.textContent = d.message || 'Unable to load system logs.';
+    listEl.appendChild(errDiv);
+    return;
+  }
+  if (badgeEl) badgeEl.textContent = 'init: ' + (d.init_system || 'unknown');
+  if (Array.isArray(d.sources)) {
+    const newOpts = ['all', ...d.sources];
+    const existing = Array.from(srcEl.options).map(o => o.value);
+    if (JSON.stringify(existing) !== JSON.stringify(newOpts)) {
+      srcEl.textContent = '';
+      for (const s of newOpts) {
+        const opt = document.createElement('option');
+        opt.value = s;
+        opt.textContent = s === 'all' ? 'All Sources' : s;
+        srcEl.appendChild(opt);
+      }
+      srcEl.value = newOpts.includes(curSrc) ? curSrc : 'all';
+    }
+  }
+  listEl.textContent = '';
+  const items = d.entries || [];
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'subtitle';
+    empty.style.padding = '12px';
+    empty.textContent = 'No log lines matched this filter.';
+    listEl.appendChild(empty);
+    return;
+  }
+  items.slice().reverse().forEach(entry => {
+    const row = document.createElement('div');
+    const lvlStr = String(entry.level || 'INFO').toUpperCase();
+    const cls = lvlStr.includes('ERR') || lvlStr.includes('CRIT') || lvlStr.includes('FATAL') ? 'log-err' : (lvlStr.includes('WARN') ? 'log-warn' : 'log-info');
+    row.className = 'log-line ' + cls;
+    row.textContent = [entry.ts, '[' + (entry.source || 'sys') + ']', '[' + lvlStr + ']'].filter(Boolean).join(' ') + ' ' + (entry.message || '');
+    listEl.appendChild(row);
+  });
+}
+
+async function loadProcesses() {
+  const el = document.getElementById('proc-list');
+  if (!el) return;
+  const d = await api('/api/processes?limit=25');
+  el.textContent = '';
+  const procs = (d && Array.isArray(d.processes)) ? d.processes : [];
+  if (!procs.length) {
+    const empty = document.createElement('div');
+    empty.className = 'subtitle';
+    empty.style.padding = '10px';
+    empty.textContent = 'No process list returned.';
+    el.appendChild(empty);
+    return;
+  }
+  for (const p of procs) {
+    const row = document.createElement('div');
+    row.className = 'row-item';
+    const col = document.createElement('div');
+    col.className = 'row-item-col';
+    const title = document.createElement('div');
+    title.className = 'row-title';
+    title.textContent = p.name + ' (PID ' + p.pid + ')';
+    const sub = document.createElement('div');
+    sub.className = 'row-sub num';
+    sub.textContent = 'CPU ' + (p.cpu_pct || 0) + '% | RAM ' + (p.rss_mb || 0) + ' MB | ' + (p.cmd || p.name);
+    col.appendChild(title);
+    col.appendChild(sub);
+    const killBtn = document.createElement('button');
+    killBtn.className = 'btn-sm btn-danger';
+    killBtn.textContent = 'Kill';
+    killBtn.addEventListener('click', () => confirmKillProc(p.pid, p.name));
+    row.appendChild(col);
+    row.appendChild(killBtn);
+    el.appendChild(row);
+  }
+}
+
+function renderServicesList() {
+  const el = document.getElementById('svc-list');
+  const q = (document.getElementById('svc-filter')?.value || '').trim().toLowerCase();
+  if (!el) return;
+  el.textContent = '';
+  const filtered = _servicesCache.filter(s => !q || String(s.name || '').toLowerCase().includes(q));
+  if (!filtered.length) {
+    const empty = document.createElement('div');
+    empty.className = 'subtitle';
+    empty.style.padding = '10px';
+    empty.textContent = 'No services matched.';
+    el.appendChild(empty);
+    return;
+  }
+  for (const s of filtered.slice(0, 60)) {
+    const row = document.createElement('div');
+    row.className = 'row-item';
+    const col = document.createElement('div');
+    col.className = 'row-item-col';
+    const title = document.createElement('div');
+    title.className = 'row-title';
+    title.textContent = s.name;
+    const sub = document.createElement('div');
+    sub.className = 'row-sub';
+    const st = String(s.status || 'unknown');
+    const isUp = st.includes('started') || st.includes('active') || st.includes('running') || st === 'ok';
+    sub.textContent = st + (s.runlevel ? (' | ' + s.runlevel) : '');
+    sub.style.color = isUp ? 'var(--success)' : 'var(--muted)';
+    col.appendChild(title);
+    col.appendChild(sub);
+    const acts = document.createElement('div');
+    acts.style.cssText = 'display:flex;gap:4px;flex-shrink:0';
+    for (const actName of (isUp ? ['restart', 'stop'] : ['start'])) {
+      const b = document.createElement('button');
+      b.className = 'btn-sm ' + (actName === 'stop' ? 'btn-danger' : (actName === 'start' ? 'btn-success' : ''));
+      b.textContent = actName[0].toUpperCase() + actName.slice(1);
+      b.addEventListener('click', () => controlSvc(s.name, actName));
+      acts.appendChild(b);
+    }
+    row.appendChild(col);
+    row.appendChild(acts);
+    el.appendChild(row);
+  }
+}
+
+function filterServices() { renderServicesList(); }
+
+async function loadServices() {
+  const d = await api('/api/services');
+  _servicesCache = (d && Array.isArray(d.services)) ? d.services : [];
+  renderServicesList();
+}
+
+async function controlSvc(name, action) {
+  toast(action + ' ' + name + '...');
+  const r = await api('/api/services', 'POST', { name, action });
+  toast(r.message || (r.ok ? 'Done' : 'Failed'));
+  loadServices();
+}
+
+async function loadDevices() {
+  const el = document.getElementById('devices-list');
+  if (!el) return;
+  const d = await api('/api/mobile/devices');
+  el.textContent = '';
+  const devs = (d && Array.isArray(d.devices)) ? d.devices : [];
+  if (!devs.length) {
+    const empty = document.createElement('div');
+    empty.className = 'subtitle';
+    empty.textContent = 'No paired mobile tokens active.';
+    el.appendChild(empty);
+    return;
+  }
+  for (const dev of devs) {
+    const row = document.createElement('div');
+    row.className = 'row-item';
+    const col = document.createElement('div');
+    col.className = 'row-item-col';
+    const title = document.createElement('div');
+    title.className = 'row-title';
+    title.textContent = dev.name || dev.id;
+    const seen = dev.last_seen ? new Date(dev.last_seen * 1000).toLocaleString() : 'Never';
+    const sub = document.createElement('div');
+    sub.className = 'row-sub num';
+    sub.textContent = 'ID: ' + dev.id + ' | Last seen: ' + seen;
+    col.appendChild(title);
+    col.appendChild(sub);
+    const revBtn = document.createElement('button');
+    revBtn.className = 'btn-sm btn-danger';
+    revBtn.textContent = 'Revoke';
+    revBtn.addEventListener('click', () => revokeDevice(dev.id, dev.name));
+    row.appendChild(col);
+    row.appendChild(revBtn);
+    el.appendChild(row);
+  }
+}
+
+async function revokeDevice(id, name) {
+  const r = await api('/api/mobile/revoke', 'POST', { id });
+  toast(r.ok ? ('Revoked ' + (name || id)) : (r.message || 'Revoke failed'));
+  loadDevices();
+}
+
+async function sendRemoteClick(button) {
+  const r = await api('/api/input', 'POST', { kind: 'click', button });
+  const st = document.getElementById('tp-status');
+  if (st) st.textContent = r.ok ? (button + ' click') : (r.message || 'Failed');
+}
+
+async function sendRemoteScroll(dy) {
+  await api('/api/input', 'POST', { kind: 'scroll', dy });
+}
+
+async function sendRemoteKey(key) {
+  const r = await api('/api/input', 'POST', { kind: 'key', key });
+  const st = document.getElementById('tp-status');
+  if (st) st.textContent = r.ok ? ('Key: ' + key) : (r.message || 'Failed');
+}
+
+(function bindTouchpad() {
+  const pad = document.getElementById('touchpad-surface');
+  if (!pad) return;
+  let lastX = null;
+  let lastY = null;
+  let moved = false;
+  let accDx = 0;
+  let accDy = 0;
+  let flushTimer = null;
+
+  const flushMove = () => {
+    flushTimer = null;
+    const dx = Math.round(accDx);
+    const dy = Math.round(accDy);
+    accDx -= dx;
+    accDy -= dy;
+    if (dx !== 0 || dy !== 0) {
+      api('/api/input', 'POST', { kind: 'move', dx, dy }).catch(() => {});
+    }
+  };
+
+  pad.addEventListener('pointerdown', (e) => {
+    pad.setPointerCapture(e.pointerId);
+    lastX = e.clientX;
+    lastY = e.clientY;
+    moved = false;
+  });
+  pad.addEventListener('pointermove', (e) => {
+    if (lastX === null) return;
+    const dx = (e.clientX - lastX) * 1.6;
+    const dy = (e.clientY - lastY) * 1.6;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    if (Math.abs(dx) > 1.5 || Math.abs(dy) > 1.5) moved = true;
+    accDx += dx;
+    accDy += dy;
+    if (!flushTimer) flushTimer = setTimeout(flushMove, 45);
+  });
+  pad.addEventListener('pointerup', () => {
+    if (!moved && lastX !== null) sendRemoteClick('left');
+    lastX = null;
+    lastY = null;
+  });
+  pad.addEventListener('pointercancel', () => { lastX = null; lastY = null; });
+})();
+
+async function submitFeedback() {
+  const statusEl = document.getElementById('fb-status');
+  const fbLinksEl = document.getElementById('fb-fallbacks');
+  const btn = document.getElementById('fb-submit-btn');
+  const subject = document.getElementById('fb-subject').value.trim();
+  const message = document.getElementById('fb-message').value.trim();
+  if (!subject || !message) {
+    statusEl.style.color = '#fde68a';
+    statusEl.textContent = 'Please fill in both Subject and Feedback details.';
+    return;
+  }
+  btn.disabled = true;
+  statusEl.style.color = 'var(--muted)';
+  statusEl.textContent = 'Sending feedback...';
+  fbLinksEl.textContent = '';
+  const r = await api('/api/feedback', 'POST', {
+    category: document.getElementById('fb-category').value,
+    subject,
+    message,
+    reply_to: document.getElementById('fb-reply').value.trim(),
+    include_sysinfo: document.getElementById('fb-sysinfo').checked,
+  });
+  btn.disabled = false;
+  if (r.ok) {
+    statusEl.style.color = '#86efac';
+    statusEl.textContent = r.message || 'Feedback delivered to brypra4@gmail.com.';
+    document.getElementById('fb-subject').value = '';
+    document.getElementById('fb-message').value = '';
+    return;
+  }
+  statusEl.style.color = '#fde68a';
+  statusEl.textContent = r.message || 'Use an option below to deliver directly.';
+  const makeLinkBtn = (label, url, primary) => {
+    if (!url || !(url.startsWith('mailto:') || url.startsWith('https://'))) return;
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = label;
+    a.style.cssText = 'display:inline-block;padding:8px 12px;border-radius:10px;text-decoration:none;font-size:12px;font-weight:700;' + (primary ? 'background:var(--accent);color:#0f172a' : 'background:rgba(255,255,255,0.08);color:var(--text);border:1px solid var(--border)');
+    fbLinksEl.appendChild(a);
+  };
+  makeLinkBtn('Open Email App', r.mailto, true);
+  makeLinkBtn('Open GitHub Issue', r.github_issue, false);
+}
+
+async function runTerminal(mode) {
+  const actType = mode || 'shell';
+  const cmd = document.getElementById('cmd-input').value.trim();
+  if (!cmd) return;
+  const autoEnter = document.getElementById('cmd-auto-enter') ? document.getElementById('cmd-auto-enter').checked : true;
+  document.getElementById('term-out').textContent = 'Running (' + actType + '): ' + cmd + ' ...';
+  const payload = { type: actType, value: cmd };
+  if (actType === 'shell_type') payload.auto_enter = autoEnter;
+  const r = await api('/api/action', 'POST', payload);
+  document.getElementById('term-out').textContent = r.output || r.message || '(No output returned)';
+}
+
+async function toggleTunnel(act) {
+  toast(act === 'start' ? 'Starting public tunnel (~4s)...' : 'Stopping tunnel...');
+  const r = await api('/api/tunnel', 'POST', { action: act });
+  refreshFullStatus(false);
+  if (r.url) toast('Public Link Online: ' + r.url);
+}
+
+async function loadFiles() {
+  if (!_authenticated) return;
+  const r = await api('/api/files');
+  const fl = document.getElementById('file-list');
+  fl.textContent = '';
+  if (!r.files || !r.files.length) {
+    const empty = document.createElement('div');
+    empty.className = 'subtitle';
+    empty.style.padding = '10px';
+    empty.textContent = 'Downloads folder is empty.';
+    fl.appendChild(empty);
+    return;
+  }
+  for (const f of r.files) {
+    const item = document.createElement('div');
+    item.className = 'row-item';
+    const col = document.createElement('div');
+    col.className = 'row-item-col';
+    col.title = f.name;
+    const title = document.createElement('div');
+    title.className = 'row-title';
+    title.textContent = f.name;
+    const sub = document.createElement('div');
+    sub.className = 'row-sub num';
+    sub.textContent = f.size;
+    col.appendChild(title);
+    col.appendChild(sub);
+    const link = document.createElement('a');
+    link.href = '/api/download?name=' + encodeURIComponent(f.name);
+    link.rel = 'noopener noreferrer';
+    link.download = f.name;
+    link.textContent = 'Download';
+    link.style.cssText = 'padding:5px 10px;font-size:11px;border-radius:8px;border:1px solid var(--border);color:var(--text);text-decoration:none;font-weight:600;background:rgba(255,255,255,0.06);flex-shrink:0';
+    item.appendChild(col);
+    item.appendChild(link);
+    fl.appendChild(item);
+  }
+}
+
+async function uploadFile() {
+  if (!_authenticated) return;
+  const inp = document.getElementById('file-upload');
+  if (!inp.files.length) return toast('Select a file first');
+  const file = inp.files[0];
+  toast('Uploading ' + file.name + '...');
+  const r = await fetch('/api/upload?name=' + encodeURIComponent(file.name), {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: _csrfToken ? { 'X-CSRF-Token': _csrfToken } : {},
+    body: file,
+  });
+  if (r.status === 401) { showLogin('Session expired. Enter access code again.'); return; }
+  const res = await r.json();
+  toast(res.message || 'Upload complete');
+  inp.value = '';
+  loadFiles();
+}
+
+initAuth();
+</script>
+</body>
+</html>

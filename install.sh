@@ -99,28 +99,67 @@ fi
 # Metode C (Hybrid Runtime Resolution for optional Fase 3 Rust daemon)
 RUNTIME_BIN="${PYTHON_BIN}"
 RUNTIME_ARGS="${INSTALL_DIR}/server.py"
+RUNTIME_LABEL="Python 3 (${INSTALL_DIR}/server.py)"
+RUNTIME_MODE="${MRC_RUNTIME:-auto}"
+if [ -z "${MRC_RUNTIME:-}" ]; then
+    [ "${MRC_USE_RUST:-}" = "0" ] && RUNTIME_MODE="python"
+    [ "${MRC_USE_RUST:-}" = "1" ] && RUNTIME_MODE="rust"
+fi
 ARCH_RAW="$(uname -m)"
-if [ "${MRC_RUNTIME:-auto}" = "rust" ] || [ "${MRC_USE_RUST:-0}" = "1" ]; then
-    if [ -x "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" ]; then
-        cp -f "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" "${INSTALL_DIR}/mobile-rc"
-    elif [ -f "${SCRIPT_DIR}/daemon-rs/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
-        echo -e "${BLUE}   Building Rust daemon from source (cargo build --release)...${NC}"
-        cargo build --release --manifest-path "${SCRIPT_DIR}/daemon-rs/Cargo.toml" || true
-        [ -x "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" ] && cp -f "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" "${INSTALL_DIR}/mobile-rc"
-    elif command -v curl >/dev/null 2>&1; then
+if [ "${RUNTIME_MODE}" != "python" ]; then
+    RUST_READY=0
+    CALLER_USER="${SUDO_USER:-${DOAS_USER:-}}"
+    if [ -f "${SCRIPT_DIR}/daemon-rs/Cargo.toml" ]; then
+        CARGO_BUILT=0
+        if [ -n "${CALLER_USER}" ] && [ "${CALLER_USER}" != "root" ]; then
+            CALLER_HOME="$(getent passwd "${CALLER_USER}" 2>/dev/null | cut -d: -f6 || true)"
+            CARGO_PATH="${PATH}${CALLER_HOME:+:${CALLER_HOME}/.cargo/bin}"
+            CARGO_BIN=""
+            if command -v runuser >/dev/null 2>&1; then
+                CARGO_BIN="$(runuser -u "${CALLER_USER}" -- env PATH="${CARGO_PATH}" sh -c 'command -v cargo 2>/dev/null || true' || true)"
+                [ -n "${CARGO_BIN}" ] && echo -e "${BLUE}   Building Rust daemon from source (cargo build --release)...${NC}" && runuser -u "${CALLER_USER}" -- env PATH="${CARGO_PATH}" "${CARGO_BIN}" build --release --manifest-path "${SCRIPT_DIR}/daemon-rs/Cargo.toml" && CARGO_BUILT=1 || true
+            elif command -v sudo >/dev/null 2>&1; then
+                CARGO_BIN="$(sudo -u "${CALLER_USER}" env PATH="${CARGO_PATH}" sh -c 'command -v cargo 2>/dev/null || true' || true)"
+                [ -n "${CARGO_BIN}" ] && echo -e "${BLUE}   Building Rust daemon from source (cargo build --release)...${NC}" && sudo -u "${CALLER_USER}" env PATH="${CARGO_PATH}" "${CARGO_BIN}" build --release --manifest-path "${SCRIPT_DIR}/daemon-rs/Cargo.toml" && CARGO_BUILT=1 || true
+            fi
+        fi
+        if [ "${CARGO_BUILT}" -eq 0 ] && command -v cargo >/dev/null 2>&1; then
+            echo -e "${BLUE}   Building Rust daemon from source (cargo build --release)...${NC}"
+            cargo build --release --manifest-path "${SCRIPT_DIR}/daemon-rs/Cargo.toml" || true
+        fi
+        if [ -x "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" ]; then
+            cp -f "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" "${INSTALL_DIR}/mobile-rc.new"
+            chmod 700 "${INSTALL_DIR}/mobile-rc.new"
+            mv -f "${INSTALL_DIR}/mobile-rc.new" "${INSTALL_DIR}/mobile-rc"
+            RUST_READY=1
+        fi
+    fi
+    if [ "${RUST_READY}" -eq 0 ] && [ -x "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" ]; then
+        cp -f "${SCRIPT_DIR}/daemon-rs/target/release/mobile-rc" "${INSTALL_DIR}/mobile-rc.new"
+        chmod 700 "${INSTALL_DIR}/mobile-rc.new"
+        mv -f "${INSTALL_DIR}/mobile-rc.new" "${INSTALL_DIR}/mobile-rc"
+        RUST_READY=1
+    fi
+    if [ "${RUST_READY}" -eq 0 ] && command -v curl >/dev/null 2>&1; then
         case "${ARCH_RAW}" in
             x86_64|amd64) RUST_ASSET="mobile-rc-linux-x86_64" ;;
             aarch64|arm64) RUST_ASSET="mobile-rc-linux-aarch64" ;;
             *) RUST_ASSET="" ;;
         esac
         if [ -n "${RUST_ASSET}" ]; then
-            curl -fsSL "https://github.com/739202873/linux-mobile-remote-control/releases/latest/download/${RUST_ASSET}" -o "${INSTALL_DIR}/mobile-rc.tmp" 2>/dev/null && mv -f "${INSTALL_DIR}/mobile-rc.tmp" "${INSTALL_DIR}/mobile-rc" || rm -f "${INSTALL_DIR}/mobile-rc.tmp"
+            curl -fsSL --connect-timeout 8 --max-time 25 \
+                "https://github.com/739202873/linux-mobile-remote-control/releases/latest/download/${RUST_ASSET}" \
+                -o "${INSTALL_DIR}/mobile-rc.tmp" 2>/dev/null \
+                && chmod 700 "${INSTALL_DIR}/mobile-rc.tmp" \
+                && mv -f "${INSTALL_DIR}/mobile-rc.tmp" "${INSTALL_DIR}/mobile-rc" \
+                && RUST_READY=1 \
+                || rm -f "${INSTALL_DIR}/mobile-rc.tmp"
         fi
     fi
-    if [ -f "${INSTALL_DIR}/mobile-rc" ]; then
-        chmod 700 "${INSTALL_DIR}/mobile-rc"
+    if [ "${RUST_READY}" -eq 1 ] && [ -x "${INSTALL_DIR}/mobile-rc" ]; then
         RUNTIME_BIN="${INSTALL_DIR}/mobile-rc"
         RUNTIME_ARGS=""
+        RUNTIME_LABEL="Native Rust (${RUNTIME_BIN})"
         echo -e "${GREEN}   Using Hybrid native runtime: ${RUNTIME_BIN}${NC}"
     else
         echo -e "${YELLOW}   Native Rust binary not available yet; using Python server.py runtime.${NC}"
@@ -296,6 +335,7 @@ echo -e "${GREEN}====================================================${NC}"
 echo -e "  Local Network Access (from phone browser):"
 echo -e "  👉 ${CYAN}http://${IP_LOCAL:-127.0.0.1}:8000${NC}"
 echo ""
+echo -e "  Runtime Engine           : ${CYAN}${RUNTIME_LABEL}${NC}"
 echo -e "  One-Time Random Code Mode (${PIN_MODE}):"
 echo -e "  🔑 Generate code on PC     : ${YELLOW}sudo control-access${NC}"
 echo -e "  📱 Show Termux pairing cmd : ${YELLOW}sudo control-access --setup-termux${NC}"

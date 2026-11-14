@@ -2,9 +2,9 @@
 
 > [!NOTE]
 > **Project Status: Under Active Development**
-> Core monitoring, Bento Grid responsive UI, live screen preview, multi-boot switching, process/service manager, paired device management, remote touchpad, Windows 10/11 host support, and OTP authentication are live. Native mobile apps (`mobile-app/`) and optional high-efficiency Rust daemon (`daemon-rs/`) are currently under active development.
+> Core monitoring, Bento Grid responsive UI, live screen preview, multi-boot switching, process/service manager, paired device management, remote touchpad, Windows 10/11 host support, OTP authentication, and the Pure Rust daemon (`daemon-rs/`, `axum` + `tokio`) with **Hybrid Runtime (`MRC_RUNTIME=auto`)** are live. Native mobile apps (`mobile-app/`) remain under active development.
 
-A lightweight, zero-dependency Web Dashboard & remote control daemon written in pure Python 3 to monitor hardware health (with real-time sparklines), manage processes and system services, inspect logs/OS inventory, preview live desktop screens, and control Linux Desktop PCs, Laptops, Workstations, and **Windows 10/11** machines directly from your smartphone (locally or over the internet).
+A lightweight Web Dashboard & remote control daemon (native **Rust `axum` + `tokio`** binary with automatic **Python 3 Standard Library** fallback via Hybrid Metode C) to monitor hardware health (with real-time sparklines), manage processes and system services, inspect logs/OS inventory, preview live desktop screens, and control Linux Desktop PCs, Laptops, Workstations, and **Windows 10/11** machines directly from your smartphone (locally or over the internet).
 
 Universally engineered to work seamlessly across major Linux distributions and desktop environments / window managers.
 
@@ -61,7 +61,7 @@ Linux Mobile Control Center intelligently adapts its screen capture, clipboard s
 - **Installed OS Scanner & Multi-Boot Switcher:** Inspect UEFI boot entries, `systemd-boot`/`GRUB`, WSL2 distros (on Windows), Btrfs subvolumes, and optional unmounted Linux root probing, paired with safe modal-confirmed Reboot, Shutdown, Lock, Sleep, and UEFI Firmware setup.
 - **Media, Volume, Display Brightness & Remote Touchpad:** Control playback, audio volume (`wpctl`/`pactl` on Linux, Windows CoreAudio COM), display brightness (`brightnessctl`/`ddcutil`/`hyprsunset` on Linux, Windows WMI), and low-latency relative cursor/click/scroll/key injection (`ydotool`/`wtype`/`xdotool` on Linux, Win32 `user32` on Windows).
 - **On-Demand Random Code (RAC), Device Tokens & Email OTP:** Single-use 6-digit codes (`control-access`), hashed Bearer tokens for native clients, and remote SMTP Email OTP for non-local access.
-- **Zero External Python Dependencies:** Host daemon and CLI use strictly Python 3 Standard Library (`ctypes`, `http.server`, `smtplib`).
+- **Hybrid Runtime Architecture (Rust + Python 3 Fallback):** `daemon-rs/` compiles into a standalone ~1.9 MiB native binary (`axum` + `tokio`, ~4.6-6.3 MB live RSS on Gentoo OpenRC), while `server.py` (strictly Python 3 Standard Library) stays bundled alongside it so any host runs out-of-the-box with zero external dependencies (`MRC_RUNTIME=auto|rust|python`).
 
 ---
 
@@ -69,6 +69,20 @@ Linux Mobile Control Center intelligently adapts its screen capture, clipboard s
 
 ```text
 linux-mobile-remote-control/
+├── .github/
+│   └── workflows/
+│       └── release.yml   # GitHub Actions release builds (Linux x86_64/aarch64 & Windows x64)
+├── daemon-rs/            # Native Rust daemon (axum + tokio)
+│   ├── Cargo.toml
+│   ├── Cargo.lock
+│   ├── assets/
+│   │   └── index.html    # Embedded Bento web dashboard
+│   └── src/
+│       ├── main.rs       # Axum HTTP router, streaming I/O & UDP 8001 discovery
+│       ├── config.rs     # Settings, TTL/mtime caches & 0600 atomic storage
+│       ├── auth.rs       # RAC, sessions, CSRF, device tokens & SMTP/feedback delivery
+│       ├── telemetry.rs  # Cross-platform Linux/Windows telemetry, logs & boot entries
+│       └── actions.rs    # Shell, input/touchpad, brightness, media, power & tunnels
 ├── nix/
 │   └── module.nix        # Declarative NixOS module (`services.mobile-rc`)
 ├── flake.nix             # NixOS / Nix Flake package & module definition
@@ -76,12 +90,12 @@ linux-mobile-remote-control/
 │   └── control-access    # Host CLI: random codes, Termux setup, --pair-info & Email OTP
 ├── termux/
 │   └── control-access    # Termux client CLI for smartphone pairing & quick login
-├── server.py             # Core HTTP API server, UDP discovery & Bento web UI (Python 3 stdlib)
-├── install.sh            # Universal Linux installer (systemd, OpenRC, dinit & runit)
-├── update.sh             # Safe Linux updater (preserves tokens, config & SSH keys)
+├── server.py             # Python 3 stdlib HTTP daemon & fallback runtime
+├── install.sh            # Universal Linux hybrid installer (systemd, OpenRC, dinit & runit)
+├── update.sh             # Safe Linux hybrid updater (updates unit/runtime & auto-rolls back)
 ├── uninstall.sh          # Clean Linux uninstaller
-├── install.ps1           # Windows 10/11 installer (Scheduled Task, Firewall & control-access.cmd)
-├── update.ps1            # Safe Windows updater with syntax check & auto-rollback
+├── install.ps1           # Windows 10/11 hybrid installer (Scheduled Task, Firewall & control-access.cmd)
+├── update.ps1            # Safe Windows hybrid updater with auto-rollback
 ├── uninstall.ps1         # Clean Windows uninstaller
 ├── .gitignore            # Git exclusion rules
 ├── LICENSE               # MIT License
@@ -92,7 +106,8 @@ linux-mobile-remote-control/
 
 ##  Requirements
 
-- **Python 3.8+** (Standard Library only)
+- **Python 3.8+** (Standard Library only; required for CLI tools & universal `server.py` fallback)
+- **Rust / Cargo (optional on host):** Used automatically during `install.sh` / `update.sh` / `install.ps1` / `update.ps1` when compiling `daemon-rs/` from source; when absent, installers attempt to fetch the matching prebuilt binary from GitHub Releases or fall back cleanly to `server.py`
 - **Screenshot capture (any of):** `grim` / `wayshot` (Wayland), `spectacle`, `gnome-screenshot`, `maim`, `scrot`, or `import` (`magick` / `convert` / Pillow optional for JPEG resizing)
 - **Window / Workspace control (depending on DE/WM):** `hyprctl`, `niri`, `qdbus6`/`qdbus`/`kdotool`, `riverctl`, `swaymsg`, `wlopm`, `wmctrl`, `xdotool`, or `xset`
 - **Audio, Backlight & Media:** `wpctl` / `pactl`, `playerctl`, `brightnessctl` / `light`
@@ -234,6 +249,7 @@ Runtime configuration and secrets are stored outside the repository in `/opt/mob
 | `MRC_EMAIL_HOURLY_MAX` | `12` | Max Email OTP / feedback emails sent per hour (min `3`) |
 | `MRC_FEEDBACK_EMAIL` | `brypra4@gmail.com` | Destination inbox for Feedback & Bug Report form when using local SMTP |
 | `MRC_FEEDBACK_WEBHOOK` | *(unset)* | Optional HTTPS webhook URL (e.g. Web3Forms/Formspree) for zero-SMTP feedback relay |
+| `MRC_RUNTIME` | `auto` | Runtime engine selection: `auto` (use/build native Rust binary if available, else Python `server.py`), `rust`, or `python` |
 | `MRC_DISCOVERY` | `1` | Set to `0` to disable background LAN UDP auto-discovery listener |
 
 ---
@@ -256,9 +272,14 @@ sudo control-access --restart        # restart service
 
 ##  Updating
 
-To pull the latest updates and safely restart the background service while preserving your existing PIN, configuration, and SSH keys:
+To pull the latest updates, resolve the active hybrid runtime (native Rust binary when available, or Python `server.py` fallback), and safely restart the background service while preserving your existing PIN, configuration, and SSH keys:
 ```bash
 sudo ./update.sh
+```
+To explicitly switch runtimes on an existing installation:
+```bash
+sudo MRC_RUNTIME=python ./update.sh --no-pull   # switch service launcher to server.py
+sudo MRC_RUNTIME=rust ./update.sh --no-pull     # build/install and activate native mobile-rc
 ```
 
 ---

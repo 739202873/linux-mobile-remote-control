@@ -60,7 +60,14 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-Write-Host "3. Updating core files (config.json preserved)..." -ForegroundColor Blue
+Write-Host "3. Stopping active service & updating core files (config.json preserved)..." -ForegroundColor Blue
+$PrevTask = Get-ScheduledTask -TaskName "Mobile-RC" -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName "Mobile-RC" -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*Mobile-RC\server.py*" -or $_.ExecutablePath -like "*Mobile-RC\mobile-rc.exe" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Milliseconds 600
+
 $BackupPath = Join-Path $InstallDir "server.py.bak"
 Copy-Item $InstalledServer $BackupPath -Force
 Copy-Item $SrcServer $InstalledServer -Force
@@ -68,20 +75,62 @@ if (Test-Path (Join-Path $ScriptDir "bin\control-access")) {
     Copy-Item (Join-Path $ScriptDir "bin\control-access") (Join-Path $InstallDir "control-access.py") -Force
 }
 
-if ($Runtime -eq "rust" -or $env:MRC_USE_RUST -eq "1") {
+$UseRust = ($Runtime -in @("auto", "rust")) -and ($env:MRC_USE_RUST -ne "0")
+if (-not $env:MRC_RUNTIME -and ($env:MRC_USE_RUST -eq "1")) { $UseRust = $true }
+$RustOut = Join-Path $InstallDir "mobile-rc.exe"
+$RustBak = Join-Path $InstallDir "mobile-rc.exe.bak"
+$HadRust = Test-Path $RustOut
+if ($HadRust) { Copy-Item $RustOut $RustBak -Force }
+
+$RustReady = $false
+if ($UseRust) {
     $LocalRust = Join-Path $ScriptDir "daemon-rs\target\release\mobile-rc.exe"
-    $RustOut = Join-Path $InstallDir "mobile-rc.exe"
-    if (Test-Path $LocalRust) {
+    $CargoToml = Join-Path $ScriptDir "daemon-rs\Cargo.toml"
+    if ((Test-Path $CargoToml) -and (Get-Command "cargo" -ErrorAction SilentlyContinue)) {
+        Write-Host "   Building native Rust daemon (cargo build --release)..." -ForegroundColor Blue
+        try { & cargo build --release --manifest-path $CargoToml } catch {}
+        if (Test-Path $LocalRust) {
+            Copy-Item $LocalRust $RustOut -Force
+            $RustReady = $true
+        }
+    }
+    if (-not $RustReady -and (Test-Path $LocalRust)) {
         Copy-Item $LocalRust $RustOut -Force
+        $RustReady = $true
+    }
+    if (-not $RustReady) {
+        try {
+            $dlUrl = "https://github.com/739202873/linux-mobile-remote-control/releases/latest/download/mobile-rc-windows-x86_64.exe"
+            Invoke-WebRequest -Uri $dlUrl -OutFile "$RustOut.tmp" -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+            Move-Item "$RustOut.tmp" $RustOut -Force
+            $RustReady = $true
+        } catch {
+            Remove-Item "$RustOut.tmp" -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
-Write-Host "4. Restarting Scheduled Task & verifying listener..." -ForegroundColor Blue
-Stop-ScheduledTask -TaskName "Mobile-RC" -ErrorAction SilentlyContinue
-Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like "*Mobile-RC\server.py*" -or $_.ExecutablePath -like "*Mobile-RC\mobile-rc.exe" } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Milliseconds 700
+$TaskExe = $PythonExe
+$TaskArg = "`"$InstalledServer`""
+$ActiveLabel = "Python 3 ($InstalledServer)"
+if ($UseRust -and $RustReady -and (Test-Path $RustOut)) {
+    $TaskExe = $RustOut
+    $TaskArg = ""
+    $ActiveLabel = "Native Rust ($RustOut)"
+} elseif ($UseRust) {
+    Write-Host "   Native Rust binary unavailable; falling back to Python server.py runtime." -ForegroundColor Yellow
+}
+
+if ($PrevTask) {
+    $NewAction = if ($TaskArg) {
+        New-ScheduledTaskAction -Execute $TaskExe -Argument $TaskArg -WorkingDirectory $InstallDir
+    } else {
+        New-ScheduledTaskAction -Execute $TaskExe -WorkingDirectory $InstallDir
+    }
+    Set-ScheduledTask -TaskName "Mobile-RC" -Action $NewAction | Out-Null
+}
+
+Write-Host "4. Starting Scheduled Task ($ActiveLabel) & verifying listener..." -ForegroundColor Blue
 Start-ScheduledTask -TaskName "Mobile-RC"
 
 $Alive = $false
@@ -93,12 +142,21 @@ for ($i = 0; $i -lt 10; $i++) {
 
 if (-not $Alive) {
     Write-Host "Error: Server did not respond on port $Port. Rolling back..." -ForegroundColor Red
+    Stop-ScheduledTask -TaskName "Mobile-RC" -ErrorAction SilentlyContinue
     if (Test-Path $BackupPath) {
         Move-Item $BackupPath $InstalledServer -Force
-        Start-ScheduledTask -TaskName "Mobile-RC" -ErrorAction SilentlyContinue
     }
+    if ($HadRust -and (Test-Path $RustBak)) {
+        Move-Item $RustBak $RustOut -Force
+    } else {
+        Remove-Item $RustBak -Force -ErrorAction SilentlyContinue
+    }
+    if ($PrevTask -and $PrevTask.Actions -and $PrevTask.Actions.Count -gt 0) {
+        Set-ScheduledTask -TaskName "Mobile-RC" -Action $PrevTask.Actions[0] | Out-Null
+    }
+    Start-ScheduledTask -TaskName "Mobile-RC" -ErrorAction SilentlyContinue
     exit 1
 }
 
-Remove-Item $BackupPath -Force -ErrorAction SilentlyContinue
-Write-Host "Mobile-RC updated and verified running on port $Port!" -ForegroundColor Green
+Remove-Item $BackupPath, $RustBak -Force -ErrorAction SilentlyContinue
+Write-Host "Mobile-RC updated ($ActiveLabel) and verified running on port $Port!" -ForegroundColor Green
